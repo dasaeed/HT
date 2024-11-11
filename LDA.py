@@ -32,3 +32,25 @@ def sim_LDA(K, V, N, M, ETA, ALPHA):
 
     X = np.asarray(X) # Convert collection of documents to numpy array
     return X
+
+def init_variation_params(X, K, V):
+    """
+    Initialize variational parameters for LDA model.
+
+    X: Collection of documents
+    K: Number of topics
+    V: Number of terms in vocabulary
+    """
+
+    N, M = X.shape # Get the number of documents and the number of words per document
+
+    # Random initialization for variational topics LAMBDA
+    LAMBDA = np.random.uniform(low=0.01, high=1.00, size=(K, V))
+
+    # Initialize variational topic proportions to 1
+    GAMMA = np.ones(shape=(N, K))
+
+    # Initialize variational topic assignments to 1/K
+    PHI = np.ones(shape=(N, M, K)) * 1/K
+
+    return LAMBDA, GAMMA, PHI
