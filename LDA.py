@@ -113,9 +113,9 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
     return ELBO
 
 
-def LSE(vec):
+def log_sum_exp(vec):
     """"
-    Log-sum-exponential function.
+    Log-sum-exponential trick.
     """
 
     max_vec = np.max(vec, axis=0)
@@ -125,3 +125,41 @@ def LSE(vec):
 
     return log_sum_exp
 
+# Example
+ETA = 1.5
+ALPHA = 0.25
+K = 20
+V = 200
+N = 10
+M = 35
+X = sim_LDA(K, V, N, M)
+LAMBDA_init, GAMMA_init, PHI_init = init_variation_params(X, K, V)
+LAMBDA = LAMBDA_init
+GAMMA = GAMMA_init
+PHI = PHI_init
+ELBOs = [0, 100] # Initialize ELBOs so that first differences are greater than 10e-4
+counter = 1
+
+# Continue to update variational parameters until ELBO has converged
+while np.abs(ELBOs[counter] - ELBOs[counter-1]) > 10e-4: # Stop when difference between current and previous is suff. small
+    # Iteratate over the j-th word in the i-th document
+    for i in range(N):
+        for j in range(M):
+            x_ij = X[i,j]
+            exp_prop = digamma(LAMBDA[:, x_ij]) - digamma(np.sum(LAMBDA[:, x_ij])) \
+                + digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))
+
+            # Update (i,j)-th element of PHI (use log-sum-exp trick to normalize topic assignment)
+            PHI[i, j] = np.exp(exp_prop - log_sum_exp(exp_prop))
+
+        # Updata i-th component of GAMMA by ALPHA_k + E[m_ik(z_i)]; expectation is sum of PHI_ijk over j=1,...,M
+        GAMMA[i] =  ALPHA * np.ones(K) + np.sum(PHI[i, :], axis=0)
+
+    # Update (k,v)-th coordinate of variational topic LAMBDA
+    for k in range(K):
+        for v in range(V): 
+            # Update is ETA plus the sum of x_ij^(v) PHI_ijk over i=1,...,N and j=1,...,M, where x_ij^(v) = 1{x_ij = v}
+            LAMBDA[k, v] = ETA + np.sum([[float(X[i,j] == v) * PHI[i, j][k] for i in range(N)] for j in range(M)])
+    
+    ELBOs.append(compute_ELBO(LAMBDA, GAMMA, PHI, X))
+    counter += 1
