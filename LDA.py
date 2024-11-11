@@ -3,7 +3,10 @@ import copy
 import numpy as np
 from scipy.special import digamma, loggamma
 
-def sim_LDA(K, V, N, M, ETA, ALPHA):
+ETA = 0.5 # Hyperparameter for V-Dirichlet topics prior
+ALPHA = 0.5 # Hyperparameter for K-Dirichlet topics proportion prior
+
+def sim_LDA(K, V, N, M):
     """
     Generate a collection of documents based on LDA model.
 
@@ -11,8 +14,6 @@ def sim_LDA(K, V, N, M, ETA, ALPHA):
     V: Number of terms in vocabulary
     N: Number of documents
     M: Number of words in each document
-    ETA: Hyperparameter for V-Dirichlet topics prior
-    ALPHA: Hyperparameter for K-Dirichlet topics proportion prior
     """
 
     # Draw topic distribution for each k = 1,...,K by V-Dirichlet(ETA, K)
@@ -54,3 +55,59 @@ def init_variation_params(X, K, V):
     PHI = np.ones(shape=(N, M, K)) * 1/K
 
     return LAMBDA, GAMMA, PHI
+
+def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
+    """
+    Compute the ELBO for a given set of variational parameters V = (LAMBDA, GAMMA, PHI).
+    """
+
+    N, M = X.shape
+    ELBO = 0 # Initialize ELBO
+
+    # EXPECTED LOG JOINT TERMS
+
+    # Sum of E[log p(BETA_k; ETA)] over k=1,...,K
+    E_log_p_BETA = 0
+    for k in range(K):
+        E_log_p_BETA += (ETA - 1) * np.sum(digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k])))
+    ELBO += E_log_p_BETA
+
+    # Sum of E[log p(THETA_i; ALPHA)] over i=1,...,N
+    E_log_p_THETA = 0
+    for i in range(N):
+        E_log_p_THETA += (ALPHA - 1) * np.sum(digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))
+    ELBO += E_log_p_THETA
+
+    # Sum of E[log p(z_ij | THETA_i)] + E[log p(x_ij | BETA, z_ij)] over i=1,...,N and j=1,...,M
+    E_q_log_p_z_x = 0
+    for i in range(N):
+        for j in range(M):
+            x_ij = X[i,j]
+            E_q_log_p_z_x += np.sum(PHI[i,j] * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))) \
+                + np.sum(PHI[i,j] * (digamma(LAMBDA[:, x_ij])) - digamma(np.sum(LAMBDA[:, x_ij], axis=0)))
+    ELBO = E_q_log_p_z_x
+
+    # ENTROPY TERMS
+
+    # Sum of -E[log q(BETA_k; LAMBDA_k)] over k=1,...,K
+    E_log_q_BETA = 0
+    for k in range(K):
+        E_log_q_BETA += -loggamma(np.sum(LAMBDA[k])) + np.sum(loggamma(LAMBDA[k])) \
+            - np.sum((LAMBDA[k] - 1) * (digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k]))))
+    ELBO += E_log_q_BETA
+
+    # Sum of -E[log q(THETA_i; GAMMA_i)] over i=1,...,N
+    E_log_q_THETA = 0
+    for i in range(N):
+        E_log_q_THETA += -loggamma(np.sum(GAMMA[i])) + np.sum(loggamma(GAMMA[i])) \
+            - np.sum((GAMMA[i] - 1) * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))))
+    ELBO += E_log_q_THETA
+
+    # Sum of -E[log(z_ij; PHI_ij)] over i=1,...,N and j=1,...,M
+    E_q_log_z = 0
+    for i in range(N):
+        for j in range(M):
+            E_q_log_z += -np.sum(PHI[i,j] * np.log(PHI[i,j]))
+    ELBO += E_q_log_z
+
+    return ELBO
