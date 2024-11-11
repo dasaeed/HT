@@ -119,10 +119,8 @@ def log_sum_exp(vec):
     Log-sum-exponential trick.
     """
 
-    max_vec = np.max(vec, axis=0)
-    exp_vec = np.exp(vec - max_vec)
-    sum_exp = np.sum(exp_vec)
-    log_sum_exp = np.log(sum_exp) + max_vec
+    alpha = np.max(vec, axis=0)
+    log_sum_exp = np.log(np.sum(np.exp(vec - alpha))) + alpha
 
     return log_sum_exp
 
