@@ -107,6 +107,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
     E_q_log_z = 0
     for i in range(N):
         for j in range(M):
+            # Negative sum of PHI[i,j,k] * log PHI[i,j,k] over N, M, K
             E_q_log_z += -np.sum(PHI[i,j] * np.log(PHI[i,j]))
     ELBO += E_q_log_z
 
@@ -129,7 +130,7 @@ def log_sum_exp(vec):
 ETA = 1.5
 ALPHA = 0.25
 K = 20
-V = 200
+V = 30
 N = 10
 M = 35
 X = sim_LDA(K, V, N, M)
