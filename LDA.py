@@ -78,6 +78,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
         E_log_p_THETA += (ALPHA - 1) * np.sum(digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))
     ELBO += E_log_p_THETA
 
+    ### Likely a problem in this term ###
     # Sum of E[log p(z_ij | THETA_i)] + E[log p(x_ij | BETA, z_ij)] over i=1,...,N and j=1,...,M
     E_q_log_p_z_x = 0
     for i in range(N):
