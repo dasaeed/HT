@@ -111,3 +111,17 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
     ELBO += E_q_log_z
 
     return ELBO
+
+
+def LSE(vec):
+    """"
+    Log-sum-exponential function.
+    """
+
+    max_vec = np.max(vec, axis=0)
+    exp_vec = np.exp(vec - max_vec)
+    sum_exp = np.sum(exp_vec)
+    log_sum_exp = np.log(sum_exp) + max_vec
+
+    return log_sum_exp
+
