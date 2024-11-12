@@ -1,6 +1,6 @@
-from tqdm import tqdm 
-import copy
+import time
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy.special import digamma, loggamma
 
 ETA = 0.5 # Hyperparameter for V-Dirichlet topics prior
@@ -25,7 +25,7 @@ def sim_LDA(K, V, N, M):
         THETA = np.random.dirichlet(ALPHA * np.ones(K), N)
 
         x = []
-        for _ in range(M): # Iterate over each word
+        for _ in range(M): # Iterate over each word (word count is constant across documents)
             z_ij = np.random.choice(K, p=THETA[i]) # Draw topic assignment by Multinom(THETA_d)
             x_ij = np.random.choice(V, p=BETA[z_ij]) # Draw observed word by Multinom(BETA_(z_ij))
             x.append(x_ij)
@@ -34,7 +34,7 @@ def sim_LDA(K, V, N, M):
     X = np.asarray(X) # Convert collection of documents to numpy array
     return X
 
-def init_variation_params(X, K, V):
+def init_variation_params(X):
     """
     Initialize variational parameters for LDA model.
 
@@ -45,10 +45,10 @@ def init_variation_params(X, K, V):
 
     N, M = X.shape # Get the number of documents and the number of words per document
 
-    # Random initialization for variational topics LAMBDA
+    # Random initialization for variational topics LAMBDA (uniform prior)
     LAMBDA = np.random.uniform(low=0.01, high=1.00, size=(K, V))
 
-    # Initialize variational topic proportions to 1
+    # Initialize variational topic proportions to 1 (maybe random initialization?)
     GAMMA = np.ones(shape=(N, K))
 
     # Initialize variational topic assignments to 1/K
@@ -56,33 +56,39 @@ def init_variation_params(X, K, V):
 
     return LAMBDA, GAMMA, PHI
 
-def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
+def compute_ELBO(LAMBDA, GAMMA, PHI, X):
     """
-    Compute the ELBO for a given set of variational parameters V = (LAMBDA, GAMMA, PHI).
+    Compute the ELBO for an LDA model given variational parameters (LAMBDA, GAMMA, PHI).
+    The computation is split between expected log joint terms and entropy terms. 
+
+    LAMBDA: Variational topic distribution for BETA
+    GAMMA: Variational document topic proportion's distribution for THETA
+    PHI: Variational categorical topic assignments
+    X: LDA-simulated collection of documents
     """
 
-    N, M = X.shape
+    N, M = X.shape # Get number of documents (N) and number of words per document (M)
     ELBO = 0 # Initialize ELBO
 
     # EXPECTED LOG JOINT TERMS
 
-    # Sum of E[log p(BETA_k; ETA)] over k=1,...,K
+    # Term is \sum_{i=1}^K E_q[log p(BETA_k; ETA)]
     E_log_p_BETA = 0
     for k in range(K):
         E_log_p_BETA += (ETA - 1) * np.sum(digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k])))
     ELBO += E_log_p_BETA
 
-    # Sum of E[log p(THETA_i; ALPHA)] over i=1,...,N
+    # Term is \sum_{i=1}^N E_q[log p(THETA_i; ALPHA)]
     E_log_p_THETA = 0
     for i in range(N):
         E_log_p_THETA += (ALPHA - 1) * np.sum(digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))
     ELBO += E_log_p_THETA
 
-    ### Likely a problem in this term ###
-    # Sum of E[log p(z_ij | THETA_i)] + E[log p(x_ij | BETA, z_ij)] over i=1,...,N and j=1,...,M
+    # Term is \sum_{i=1}^N \sum_{j=1}^M (E_q[log p(z_ij | THETA_i)] + E_q[log p(x_ij | BETA, z_ij)])
     E_q_log_p_z_x = 0
     for i in range(N):
         for j in range(M):
+            # For E_q[log BETA_{k, x_ij}] term, x_{ij} is some assignment from vocabulary v=1,...,V
             x_ij = X[i,j]
             E_q_log_p_z_x += np.sum(PHI[i,j] * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))) \
                 + np.sum(PHI[i,j] * (digamma(LAMBDA[:, x_ij])) - digamma(np.sum(LAMBDA[:, x_ij], axis=0)))
@@ -90,25 +96,24 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
 
     # ENTROPY TERMS
 
-    # Sum of -E[log q(BETA_k; LAMBDA_k)] over k=1,...,K
+    # Term is -\sum_{k=1}^K E_q[log q(BETA_k; LAMBDA_k)]
     E_log_q_BETA = 0
     for k in range(K):
         E_log_q_BETA += -loggamma(np.sum(LAMBDA[k])) + np.sum(loggamma(LAMBDA[k])) \
             - np.sum((LAMBDA[k] - 1) * (digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k]))))
     ELBO += E_log_q_BETA
 
-    # Sum of -E[log q(THETA_i; GAMMA_i)] over i=1,...,N
+    # Term is -\sum_{i=1}^N E_q[log q(THETA_i; GAMMA_i)]
     E_log_q_THETA = 0
     for i in range(N):
         E_log_q_THETA += -loggamma(np.sum(GAMMA[i])) + np.sum(loggamma(GAMMA[i])) \
             - np.sum((GAMMA[i] - 1) * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))))
     ELBO += E_log_q_THETA
 
-    # Sum of -E[log(z_ij; PHI_ij)] over i=1,...,N and j=1,...,M
+    # Term is -\sum_{i=1}^n \sum_{j=1}^M E_q[log q(z_ij; PHI_ij)]
     E_q_log_z = 0
     for i in range(N):
         for j in range(M):
-            # Negative sum of PHI[i,j,k] * log PHI[i,j,k] over N, M, K
             E_q_log_z += -np.sum(PHI[i,j] * np.log(PHI[i,j]))
     ELBO += E_q_log_z
 
@@ -117,7 +122,8 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, X, K, V):
 
 def log_sum_exp(vec):
     """"
-    Log-sum-exponential trick.
+    Log-sum-exponential trick. Used to normalize the categorical 
+    distribution of PHI[i, j] in CAVI updates.
     """
 
     alpha = np.max(vec, axis=0)
@@ -125,41 +131,58 @@ def log_sum_exp(vec):
 
     return log_sum_exp
 
-# Example
-ETA = 1.5
-ALPHA = 0.25
-K = 20
-V = 30
-N = 10
-M = 35
-X = sim_LDA(K, V, N, M)
-LAMBDA_init, GAMMA_init, PHI_init = init_variation_params(X, K, V)
-LAMBDA = LAMBDA_init
-GAMMA = GAMMA_init
-PHI = PHI_init
-ELBOs = [0, 100] # Initialize ELBOs so that first differences are greater than 10e-4
-counter = 1
+########## EXAMPLE ##########
 
-# Continue to update variational parameters until ELBO has converged
-while np.abs(ELBOs[counter] - ELBOs[counter-1]) > 10e-4: # Stop when difference between current and previous is suff. small
-    # Iteratate over the j-th word in the i-th document
+K = 10 # Number of topics
+V = 50 # Number of terms in the vocabulary
+N = 20 # Number of documents
+M = 30 # Number of words per document
+ETA = 0.5 # Hyperparameter for V-Dirichlet topics prior
+ALPHA = 0.5 # Hyperparameter for K-Dirichlet topics proportion prior
+X = sim_LDA(K, V, N, M) # Simulate LDA-collection of documents
+
+start = time.time()
+LAMBDA, GAMMA, PHI = init_variation_params(X)
+curr_ELBO = 100 # Initialize current ELBO value (initially arbitrarily greater than prev_ELBO)
+prev_ELBO = 0 # Initialize previous ELBO value (initially arbitrarily smaller than curr_ELBO)
+ELBOs = [] # Store ELBO values for plotting
+tol = 10e-10 # Tolerance for convergence of ELBO
+
+# Continue to update variational parameters until ELBO has converged with respect to tolerance (tol)
+while np.abs(curr_ELBO - prev_ELBO) > tol:
+    # Update variational topic assignment PHI[i, j]
     for i in range(N):
         for j in range(M):
-            x_ij = X[i,j]
-            exp_prop = digamma(LAMBDA[:, x_ij]) - digamma(np.sum(LAMBDA[:, x_ij])) \
+            # Again, x_ij is just an assignment of the vocabulary v=1,...,V so can treat it as such
+            x_ij = X[i, j]
+
+            # Calculate the expression inside the exponential for which PHI[i, j] is proportional to
+            exp_propto = digamma(LAMBDA[:, x_ij]) - digamma(np.sum(LAMBDA[:, x_ij])) \
                 + digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))
+            
+            # Use log-sum-exp trick to normalize PHI[i, j] over k
+            PHI[i, j] = np.exp(exp_propto - log_sum_exp(exp_propto))
 
-            # Update (i,j)-th element of PHI (use log-sum-exp trick to normalize topic assignment)
-            PHI[i, j] = np.exp(exp_prop - log_sum_exp(exp_prop))
+        # Update variational topic proportions GAMMA[i]
+        for k in range(K):
+            # Update is ALPHA + sum_{j=1}^M PHI_ijk
+            GAMMA[i, k] = ALPHA + np.sum(PHI[i][:, k])
 
-        # Updata i-th component of GAMMA by ALPHA_k + E[m_ik(z_i)]; expectation is sum of PHI_ijk over j=1,...,M
-        GAMMA[i] =  ALPHA * np.ones(K) + np.sum(PHI[i, :], axis=0)
-
-    # Update (k,v)-th coordinate of variational topic LAMBDA
+    # Update variational topic LAMBDA[k]
     for k in range(K):
-        for v in range(V): 
-            # Update is ETA plus the sum of x_ij^(v) PHI_ijk over i=1,...,N and j=1,...,M, where x_ij^(v) = 1{x_ij = v}
+        for v in range(V):
+            # Update is ETA + \sum_{i=1}^N \sum_{j=1}^M 1{x_ij = v} PHI_ijk
             LAMBDA[k, v] = ETA + np.sum([[float(X[i,j] == v) * PHI[i, j][k] for i in range(N)] for j in range(M)])
     
-    ELBOs.append(compute_ELBO(LAMBDA, GAMMA, PHI, X))
-    counter += 1
+    prev_ELBO = curr_ELBO # Set the previous ELBO to the current value of previous iteration
+    curr_ELBO = compute_ELBO(LAMBDA, GAMMA, PHI, X) # Compute ELBO for updated parameters; set current ELBO to new ELBO
+    ELBOs.append(curr_ELBO) # Store computed ELBO values
+
+total_time = time.time() - start
+
+fig, axes = plt.subplots()
+axes.set_xlabel("Seconds")
+axes.set_ylabel("ELBO")
+axes.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
+
+axes.plot(np.linspace(0, total_time, len(ELBOs)), ELBOs)
