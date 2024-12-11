@@ -31,9 +31,9 @@ for doc in documents:
     if word_idxs:
         corpus_matrix.append(word_idxs)
 
-K = 30
+K = 100
 V = len(vocab)
-ALPHA = 0.5
+ALPHA = 0.1
 ETA = 1 / V
 
 def log_sum_exp(vec):
