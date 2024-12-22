@@ -35,7 +35,7 @@ def load_data():
     articles = np.zeros((N, V))
     nonzero_idxs = []
 
-    for i in tqdm(range(N)):
+    for i in range(N):
         split = raw_lines[i].split(" ")
         n_words = int(split[0])
         split = split[1:]
@@ -199,7 +199,7 @@ word_topic_probs = LAMBDA / LAMBDA.sum(axis=1, keepdims=True)
 top_words = {}
 for k in range(word_topic_probs.shape[0]):
     top_idxs = np.argsort(word_topic_probs[k, :])[-10:][::-1]
-    top_words[k] = [vocab[v] for v in top_idxs]
+    top_words[k] = [idx_to_words[v] for v in top_idxs]
 
 formatted_text = "Top 10 Words for Each Topic:\n\n"
 for topic, words in top_words.items():
