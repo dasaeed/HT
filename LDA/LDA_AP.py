@@ -125,7 +125,6 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, articles, nonzero_idxs, K):
 
     return ELBO
 
-
 start = time.time()
 idx_to_words, articles, nonzero_idxs = load_data()
 N, V = articles.shape
@@ -138,7 +137,7 @@ ELBOs = []
 prev_ELBO = -np.inf
 curr_ELBO = compute_ELBO(LAMBDA, GAMMA, PHI, articles, nonzero_idxs, K)
 ELBOs.append(curr_ELBO)
-print(f"Initial ELBO: {ELBOs[0]}")
+print(f"Initial ELBO: {ELBOs[0]}\n")
 
 max_iterations = 100
 tol = 10e-3
@@ -186,3 +185,25 @@ for t in range(max_iterations):
     if abs(curr_ELBO - prev_ELBO) < tol:
         break
 stop = time.time()
+
+time_iter = np.linspace(0, float(stop-start), len(ELBOs))
+ELBOs = np.asarray(ELBOs)
+data = {
+    "time_iter": time_iter,
+    "ELBO": ELBOs
+}
+ELBO_per_time_iter = pd.DataFrame(data=data)
+ELBO_per_time_iter.to_csv("ELBO_V_10000.csv", index=False)
+
+word_topic_probs = LAMBDA / LAMBDA.sum(axis=1, keepdims=True)
+top_words = {}
+for k in range(word_topic_probs.shape[0]):
+    top_idxs = np.argsort(word_topic_probs[k, :])[-10:][::-1]
+    top_words[k] = [vocab[v] for v in top_idxs]
+
+formatted_text = "Top 10 Words for Each Topic:\n\n"
+for topic, words in top_words.items():
+    formatted_text += f"Topic {topic + 1}: "
+    formatted_text += ", ".join(words) + "\n\n"
+
+print(formatted_text)
