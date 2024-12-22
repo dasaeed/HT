@@ -186,6 +186,10 @@ for t in range(max_iterations):
         break
 stop = time.time()
 
+LAMBDA_final = copy.deepcopy(LAMBDA_t)
+GAMMA_final = copy.deepcopy(GAMMA_t)
+PHI_final = copy.deepcopy(PHI_t)
+
 time_iter = np.linspace(0, float(stop-start), len(ELBOs))
 ELBOs = np.asarray(ELBOs)
 data = {
@@ -195,7 +199,7 @@ data = {
 ELBO_per_time_iter = pd.DataFrame(data=data)
 ELBO_per_time_iter.to_csv("ELBO_V_10000.csv", index=False)
 
-word_topic_probs = LAMBDA / LAMBDA.sum(axis=1, keepdims=True)
+word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
 top_words = {}
 for k in range(word_topic_probs.shape[0]):
     top_idxs = np.argsort(word_topic_probs[k, :])[-10:][::-1]
