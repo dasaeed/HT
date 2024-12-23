@@ -128,7 +128,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, articles, nonzero_idxs, K):
 start = time.time()
 idx_to_words, articles, nonzero_idxs = load_data()
 N, V = articles.shape
-K = 20
+K = 30
 ETA = 100 / V
 ALPHA = 1 / K
 LAMBDA, GAMMA, PHI = init_variational_params(articles, K)
@@ -146,7 +146,7 @@ GAMMA_t = copy.deepcopy(GAMMA)
 PHI_t = copy.deepcopy(PHI)
 
 for t in range(max_iterations):
-    print(f"Iteration {t}")
+    print(f"Iteration {t+1}")
     for i in tqdm(range(N), desc="Updating PHI and GAMMA"):
         article = articles[i]
         nonzero_idx = nonzero_idxs[i]
@@ -180,6 +180,7 @@ for t in range(max_iterations):
 
     prev_ELBO = curr_ELBO
     curr_ELBO = compute_ELBO(LAMBDA_t, GAMMA_t, PHI_t, articles, nonzero_idxs, K)
+    ELBOs.append(curr_ELBO)
     print(f"Current ELBO: {curr_ELBO} | Change in ELBO: {curr_ELBO - prev_ELBO}\n")
 
     if abs(curr_ELBO - prev_ELBO) < tol:
@@ -202,7 +203,7 @@ ELBO_per_time_iter.to_csv("ELBO_V_10000.csv", index=False)
 word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
 top_words = {}
 for k in range(word_topic_probs.shape[0]):
-    top_idxs = np.argsort(word_topic_probs[k, :])[-10:][::-1]
+    top_idxs = np.argsort(word_topic_probs[k, :])[-15:][::-1]
     top_words[k] = [idx_to_words[v] for v in top_idxs]
 
 formatted_text = "Top 10 Words for Each Topic:\n\n"
