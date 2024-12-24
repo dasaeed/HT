@@ -21,126 +21,110 @@ def log_sum_exp(vec):
     log_sum_exp = np.log(sum_exp_vec) + vec_max
     return log_sum_exp
 
-def load_data():
-    with open("vocab.txt", "r") as f:
-        raw_lines = f.readlines()
-
+def load_documents():
+    with open("vocab.txt", "r") as file:
+        raw_lines = file.readlines()
     idx_to_words = [word.strip() for word in raw_lines]
     V = len(idx_to_words)
 
-    with open("ap_bow.txt", "r") as f:
-        raw_lines = f.readlines()
+    with open("ap_bow.txt", "r") as file:
+        raw_lines = file.readlines()
         N = len(raw_lines)
-        
-    articles = np.zeros((N, V))
+    documents = np.zeros((N, V))
     nonzero_idxs = []
 
-    for i in range(N):
+    for i in tqdm(range(N)):
         split = raw_lines[i].split(" ")
-        n_words = int(split[0])
+        M = int(split[0])
         split = split[1:]
-
-        article = np.zeros((V,))
+        document = np.zeros((V,))
         nonzero_idx = []
-
         for bow in split:
             bow = bow.strip()
             word_idx, count = bow.split(":")
             nonzero_idx.append(int(word_idx))
-            article[int(word_idx)] = count
+            document[int(word_idx)] = count
 
         try:
-            assert(len(nonzero_idx) == n_words)
+            assert(len(nonzero_idx) == M)
         except:
-            raise AssertionError(f"{len(nonzero_idx)}, {n_words}")
+            raise AssertionError(f"{len(nonzero_idx)}, {M}")
 
-        articles[i] = article
+        documents[i] = document
         nonzero_idxs.append(sorted(nonzero_idx))
     
-    return idx_to_words, articles, nonzero_idxs
+    return idx_to_words, documents, nonzero_idxs
 
-def init_variational_params(articles, K):
-    N, V = articles.shape
+def init_variational_params(documents, K):
+    N, V = documents.shape
     LAMBDA = np.random.uniform(low=0.01, high=1.0, size=(K, V))
     GAMMA = np.ones((N, K))
     PHI = []
-    for article in articles:
-        n_words = np.sum((article > 0).astype("int32"))
-        article_PHI = np.ones((n_words, K))
-        article_PHI = article_PHI / K
-
-        PHI.append(article_PHI)
+    for document in documents:
+        M = np.sum((document > 0).astype("int32"))
+        document_PHI = np.ones((M, K))
+        document_PHI = document_PHI / K
+        PHI.append(document_PHI)
+        
     return LAMBDA, GAMMA, PHI
 
-def compute_ELBO(LAMBDA, GAMMA, PHI, articles, nonzero_idxs, K):
+def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
     ELBO = 0
-    N, V = articles.shape
+    N, _ = documents.shape
 
-    E_log_p_beta = 0
-    for k in range(K):
-        E_log_p_beta += (ETA-1) * np.sum(digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k])))
-    ELBO += E_log_p_beta
+    E_log_p_BETA = np.sum((ETA-1) * (digamma(LAMBDA) - digamma(np.sum(LAMBDA, axis=1, keepdims=True))))
+    ELBO += E_log_p_BETA
 
-    E_log_p_theta = 0
+    E_log_p_THETA = np.sum((ALPHA-1) * (digamma(GAMMA) - digamma(np.sum(GAMMA, axis=1, keepdims=True))))
+    ELBO += E_log_p_THETA
+
+    E_log_p_x_z = 0
     for i in range(N):
-        E_log_p_theta += (ALPHA-1) * np.sum(digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i])))
-    ELBO += E_log_p_theta
-
-    E_log_p_xz = 0
-    for i in range(N):
-        article = articles[i]
+        document = documents[i]
         nonzero_idx = nonzero_idxs[i]
-        corr_idx = 0
+        word_idx = 0
         for idx in nonzero_idx:
-            E_log_p_xz += article[idx] * np.sum(PHI[i][corr_idx] * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))))
-            E_log_p_xz += article[idx] * np.sum(PHI[i][corr_idx] * (digamma(LAMBDA[:,idx]) - digamma(np.sum(LAMBDA, axis=1))))
-            corr_idx += 1
+            E_log_p_x_z += document[idx] * np.sum(PHI[i][word_idx] * (digamma(GAMMA[i])-digamma(np.sum(GAMMA[i])))) \
+                + document[idx] * np.sum(PHI[i][word_idx] * (digamma(LAMBDA[:, idx])-digamma(np.sum(LAMBDA, axis=1))))
+            word_idx += 1
+    ELBO += E_log_p_x_z
 
-        assert(corr_idx == len(nonzero_idx))
-    ELBO += E_log_p_xz
+    E_log_q_BETA = np.sum(-loggamma(np.sum(LAMBDA, axis=1)) + np.sum(loggamma(LAMBDA), axis=1) \
+        - np.sum((LAMBDA - 1) * (digamma(LAMBDA) - digamma(np.sum(LAMBDA, axis=1, keepdims=True))), axis=1))
+    ELBO += E_log_q_BETA
 
-    E_log_q_beta = 0
-    for k in range(K):
-        E_log_q_beta += -loggamma(np.sum(LAMBDA[k])) + np.sum(loggamma(LAMBDA[k]))
-        E_log_q_beta += -np.sum((LAMBDA[k]-1) * (digamma(LAMBDA[k]) - digamma(np.sum(LAMBDA[k]))))
-    ELBO += E_log_q_beta
-
-    E_log_q_theta = 0
-    for i in range(N):
-        E_log_q_theta += -loggamma(np.sum(GAMMA[i])) + np.sum(loggamma(GAMMA[i]))
-        E_log_q_theta += -np.sum((GAMMA[i]-1) * (digamma(GAMMA[i]) - digamma(np.sum(GAMMA[i]))))
-    ELBO += E_log_q_theta
+    E_log_q_THETA = np.sum(-loggamma(np.sum(GAMMA, axis=1)) + np.sum(loggamma(GAMMA), axis=1) \
+        - np.sum((GAMMA - 1) * (digamma(GAMMA) - digamma(np.sum(GAMMA, axis=1, keepdims=True))), axis=1))
+    ELBO += E_log_q_THETA
 
     E_log_q_z = 0
     for i in range(N):
-        article = articles[i]
+        document = documents[i]
         nonzero_idx = nonzero_idxs[i]
-        corr_idx = 0
+        word_idx = 0
         for idx in nonzero_idx:
-            E_log_q_z += -article[idx] * np.sum(PHI[i][corr_idx] * np.log(PHI[i][corr_idx]))
-            corr_idx += 1
-
-        assert(corr_idx == len(nonzero_idx))
+            E_log_q_z += -document[idx] * np.sum(PHI[i][word_idx] * np.log(PHI[i][word_idx]))
+            word_idx += 1
     ELBO += E_log_q_z
 
     return ELBO
 
 start = time.time()
-idx_to_words, articles, nonzero_idxs = load_data()
-N, V = articles.shape
-K = 30
+idx_to_words, documents, nonzero_idxs = load_documents()
+N, V = documents.shape
+K = 40
 ETA = 100 / V
 ALPHA = 1 / K
-LAMBDA, GAMMA, PHI = init_variational_params(articles, K)
+LAMBDA, GAMMA, PHI = init_variational_params(documents, K)
 
 ELBOs = []
 prev_ELBO = -np.inf
-curr_ELBO = compute_ELBO(LAMBDA, GAMMA, PHI, articles, nonzero_idxs, K)
+curr_ELBO = compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K)
 ELBOs.append(curr_ELBO)
 print(f"Initial ELBO: {ELBOs[0]}\n")
 
-max_iterations = 100
-tol = 10e-3
+max_iterations = 200
+tol = 10e-1
 LAMBDA_t = copy.deepcopy(LAMBDA)
 GAMMA_t = copy.deepcopy(GAMMA)
 PHI_t = copy.deepcopy(PHI)
@@ -148,7 +132,7 @@ PHI_t = copy.deepcopy(PHI)
 for t in range(max_iterations):
     print(f"Iteration {t+1}")
     for i in tqdm(range(N), desc="Updating PHI and GAMMA"):
-        article = articles[i]
+        article = documents[i]
         nonzero_idx = nonzero_idxs[i]
         GAMMA_i_t = copy.deepcopy(GAMMA_t[i])
         corr_idx = 0
@@ -156,8 +140,7 @@ for t in range(max_iterations):
             log_PHI_ij = np.zeros((K,))
             for k in range(K):
                 LAMBDA_k_t = copy.deepcopy(LAMBDA_t[k])
-                exp_propto = digamma(GAMMA_i_t[k]) - digamma(np.sum(GAMMA_i_t))
-                exp_propto += digamma(LAMBDA_k_t[idx]) - digamma(np.sum(LAMBDA_k_t))
+                exp_propto = digamma(GAMMA_i_t[k]) - digamma(np.sum(GAMMA_i_t)) + digamma(LAMBDA_k_t[idx]) - digamma(np.sum(LAMBDA_k_t))
                 log_PHI_ij[k] = exp_propto
             PHI_ij = np.exp(log_PHI_ij - log_sum_exp(log_PHI_ij))
             PHI_t[i][corr_idx] = PHI_ij
@@ -203,7 +186,7 @@ ELBO_per_time_iter.to_csv("ELBO_V_10000.csv", index=False)
 word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
 top_words = {}
 for k in range(word_topic_probs.shape[0]):
-    top_idxs = np.argsort(word_topic_probs[k, :])[-15:][::-1]
+    top_idxs = np.argsort(word_topic_probs[k, :])[-20:][::-1]
     top_words[k] = [idx_to_words[v] for v in top_idxs]
 
 formatted_text = "Top 10 Words for Each Topic:\n\n"
