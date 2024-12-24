@@ -27,28 +27,24 @@ def load_documents():
     idx_to_words = [word.strip() for word in raw_lines]
     V = len(idx_to_words)
 
-    with open("ap_bow.txt", "r") as file:
+    with open("AP_BoW.txt", "r") as file:
         raw_lines = file.readlines()
         N = len(raw_lines)
     documents = np.zeros((N, V))
     nonzero_idxs = []
 
     for i in tqdm(range(N)):
-        split = raw_lines[i].split(" ")
-        M = int(split[0])
-        split = split[1:]
+        BoW_doc = raw_lines[i].split(" ")
+        M = int(BoW_doc[0])
+        BoW_doc = BoW_doc[1:]
         document = np.zeros((V,))
         nonzero_idx = []
-        for bow in split:
-            bow = bow.strip()
-            word_idx, count = bow.split(":")
+        for BoW in BoW_doc:
+            BoW = BoW.strip()
+            word_idx, count = BoW.split(":")
             nonzero_idx.append(int(word_idx))
             document[int(word_idx)] = count
-
-        try:
-            assert(len(nonzero_idx) == M)
-        except:
-            raise AssertionError(f"{len(nonzero_idx)}, {M}")
+        assert(len(nonzero_idx) == M)
 
         documents[i] = document
         nonzero_idxs.append(sorted(nonzero_idx))
@@ -112,7 +108,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
 start = time.time()
 idx_to_words, documents, nonzero_idxs = load_documents()
 N, V = documents.shape
-K = 40
+K = 30
 ETA = 100 / V
 ALPHA = 1 / K
 LAMBDA, GAMMA, PHI = init_variational_params(documents, K)
@@ -132,10 +128,10 @@ PHI_t = copy.deepcopy(PHI)
 for t in range(max_iterations):
     print(f"Iteration {t+1}")
     for i in tqdm(range(N), desc="Updating PHI and GAMMA"):
-        article = documents[i]
+        document = documents[i]
         nonzero_idx = nonzero_idxs[i]
         GAMMA_i_t = copy.deepcopy(GAMMA_t[i])
-        corr_idx = 0
+        word_idx = 0
         for idx in nonzero_idx:
             log_PHI_ij = np.zeros((K,))
             for k in range(K):
@@ -143,26 +139,26 @@ for t in range(max_iterations):
                 exp_propto = digamma(GAMMA_i_t[k]) - digamma(np.sum(GAMMA_i_t)) + digamma(LAMBDA_k_t[idx]) - digamma(np.sum(LAMBDA_k_t))
                 log_PHI_ij[k] = exp_propto
             PHI_ij = np.exp(log_PHI_ij - log_sum_exp(log_PHI_ij))
-            PHI_t[i][corr_idx] = PHI_ij
-            corr_idx += 1
+            PHI_t[i][word_idx] = PHI_ij
+            word_idx += 1
         GAMMA_i_t = np.zeros((K,)) + ALPHA
         for k in range(K):
-            GAMMA_i_t[k] += np.sum(article[nonzero_idx] * PHI_t[i][:,k])
+            GAMMA_i_t[k] += np.sum(document[nonzero_idx] * PHI_t[i][:, k])
         GAMMA_t[i] = GAMMA_i_t
 
     for k in tqdm(range(K), desc="Updating LAMBDA"):
         LAMBDA_k_t = np.zeros((V,)) + ETA
         for i in range(N):
-            article = articles[i]
+            document = documents[i]
             nonzero_idx = nonzero_idxs[i]
-            corr_idx = 0
+            word_idx = 0
             for idx in nonzero_idx:
-                LAMBDA_k_t[idx] += article[idx] * PHI_t[i][corr_idx][k]
-                corr_idx += 1
+                LAMBDA_k_t[idx] += document[idx] * PHI_t[i][word_idx][k]
+                word_idx += 1
             LAMBDA_t[k] = LAMBDA_k_t
 
     prev_ELBO = curr_ELBO
-    curr_ELBO = compute_ELBO(LAMBDA_t, GAMMA_t, PHI_t, articles, nonzero_idxs, K)
+    curr_ELBO = compute_ELBO(LAMBDA_t, GAMMA_t, PHI_t, documents, nonzero_idxs, K)
     ELBOs.append(curr_ELBO)
     print(f"Current ELBO: {curr_ELBO} | Change in ELBO: {curr_ELBO - prev_ELBO}\n")
 
@@ -181,7 +177,7 @@ data = {
     "ELBO": ELBOs
 }
 ELBO_per_time_iter = pd.DataFrame(data=data)
-ELBO_per_time_iter.to_csv("ELBO_V_10000.csv", index=False)
+ELBO_per_time_iter.to_csv("AP_K_30_V_all.csv", index=False)
 
 word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
 top_words = {}
@@ -189,7 +185,7 @@ for k in range(word_topic_probs.shape[0]):
     top_idxs = np.argsort(word_topic_probs[k, :])[-20:][::-1]
     top_words[k] = [idx_to_words[v] for v in top_idxs]
 
-formatted_text = "Top 10 Words for Each Topic:\n\n"
+formatted_text = "Top 20 Words for Each Topic:\n\n"
 for topic, words in top_words.items():
     formatted_text += f"Topic {topic + 1}: "
     formatted_text += ", ".join(words) + "\n\n"
