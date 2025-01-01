@@ -108,7 +108,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
 start = time.time()
 idx_to_words, documents, nonzero_idxs = load_documents()
 N, V = documents.shape
-K = 30
+K = 20
 ETA = 100 / V
 ALPHA = 1 / K
 LAMBDA, GAMMA, PHI = init_variational_params(documents, K)
@@ -120,7 +120,7 @@ ELBOs.append(curr_ELBO)
 print(f"Initial ELBO: {ELBOs[0]}\n")
 
 max_iterations = 200
-tol = 10e-1
+tol = 10e-2
 LAMBDA_t = copy.deepcopy(LAMBDA)
 GAMMA_t = copy.deepcopy(GAMMA)
 PHI_t = copy.deepcopy(PHI)
