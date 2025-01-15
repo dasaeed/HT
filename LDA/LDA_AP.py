@@ -80,8 +80,8 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
         nonzero_idx = nonzero_idxs[i]
         word_idx = 0
         for idx in nonzero_idx:
-            E_log_p_x_z += document[idx] * np.sum(PHI[i][word_idx] * (digamma(GAMMA[i])-digamma(np.sum(GAMMA[i])))) \
-                + document[idx] * np.sum(PHI[i][word_idx] * (digamma(LAMBDA[:, idx])-digamma(np.sum(LAMBDA, axis=1))))
+            E_log_p_x_z += np.sum(PHI[i][word_idx] * (digamma(GAMMA[i])-digamma(np.sum(GAMMA[i])))) \
+                + np.sum(PHI[i][word_idx] * (digamma(LAMBDA[:, idx])-digamma(np.sum(LAMBDA, axis=1))))
             word_idx += 1
     ELBO += E_log_p_x_z
 
@@ -99,7 +99,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
         nonzero_idx = nonzero_idxs[i]
         word_idx = 0
         for idx in nonzero_idx:
-            E_log_q_z += -document[idx] * np.sum(PHI[i][word_idx] * np.log(PHI[i][word_idx]))
+            E_log_q_z += np.sum(PHI[i][word_idx] * np.log(PHI[i][word_idx]))
             word_idx += 1
     ELBO += E_log_q_z
 
@@ -108,7 +108,7 @@ def compute_ELBO(LAMBDA, GAMMA, PHI, documents, nonzero_idxs, K):
 start = time.time()
 idx_to_words, documents, nonzero_idxs = load_documents()
 N, V = documents.shape
-K = 20
+K = 10
 ETA = 100 / V
 ALPHA = 1 / K
 LAMBDA, GAMMA, PHI = init_variational_params(documents, K)
@@ -120,7 +120,7 @@ ELBOs.append(curr_ELBO)
 print(f"Initial ELBO: {ELBOs[0]}\n")
 
 max_iterations = 200
-tol = 10e-2
+tol = 0.1
 LAMBDA_t = copy.deepcopy(LAMBDA)
 GAMMA_t = copy.deepcopy(GAMMA)
 PHI_t = copy.deepcopy(PHI)
