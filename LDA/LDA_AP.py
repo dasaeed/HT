@@ -13,6 +13,34 @@ from nltk.tokenize import word_tokenize
 from collections import Counter
 from tqdm import tqdm
 from scipy.special import digamma, loggamma
+from scipy.sparse import csr_matrix
+
+def simulate_LDA(N, Ms, K, V, ETA, ALPHA, rs_int=np.random.randint(low=0, high=100)):
+    rs = npr.RandomState(rs_int) 
+    BETA = rs.dirichlet(np.full(V, ETA), size=K)
+    THETA = rs.dirichlet(np.full(K, ALPHA), size=N)
+    
+    row_idxs = []
+    col_idxs = []
+    values = []
+    nonzero_idxs = []
+
+    for i in range(N):
+        doc_word_counts = np.zeros(V)
+        for _ in range(Ms[i]):
+            z_ij = rs.choice(K, p=THETA[i])
+            x_ij = rs.choice(V, p=BETA[z_ij])
+            doc_word_counts[x_ij] += 1
+        doc_nonzero = np.nonzero(doc_word_counts)[0]
+        doc_nonzero = np.array(sorted(doc_nonzero))
+        nonzero_idxs.append(doc_nonzero)
+
+        row_idxs.extend([i] * len(doc_nonzero))
+        col_idxs.extend(doc_nonzero)
+        values.extend(doc_word_counts[doc_nonzero])
+    documents = csr_matrix((values, (row_idxs, col_idxs)), shape=(N, V)).toarray()
+    
+    return documents, nonzero_idxs
 
 def log_sum_exp(vec):
     vec_max = np.max(vec, axis=0)
@@ -177,17 +205,17 @@ data = {
     "ELBO": ELBOs
 }
 ELBO_per_time_iter = pd.DataFrame(data=data)
-ELBO_per_time_iter.to_csv("AP_K_30_V_all.csv", index=False)
+# ELBO_per_time_iter.to_csv("AP_K_30_V_all.csv", index=False)
 
-word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
-top_words = {}
-for k in range(word_topic_probs.shape[0]):
-    top_idxs = np.argsort(word_topic_probs[k, :])[-20:][::-1]
-    top_words[k] = [idx_to_words[v] for v in top_idxs]
+# word_topic_probs = LAMBDA_final / LAMBDA_final.sum(axis=1, keepdims=True)
+# top_words = {}
+# for k in range(word_topic_probs.shape[0]):
+#     top_idxs = np.argsort(word_topic_probs[k, :])[-20:][::-1]
+#     top_words[k] = [idx_to_words[v] for v in top_idxs]
 
-formatted_text = "Top 20 Words for Each Topic:\n\n"
-for topic, words in top_words.items():
-    formatted_text += f"Topic {topic + 1}: "
-    formatted_text += ", ".join(words) + "\n\n"
+# formatted_text = "Top 20 Words for Each Topic:\n\n"
+# for topic, words in top_words.items():
+#     formatted_text += f"Topic {topic + 1}: "
+#     formatted_text += ", ".join(words) + "\n\n"
 
-print(formatted_text)
+# print(formatted_text)
