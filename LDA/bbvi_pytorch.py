@@ -164,9 +164,9 @@ def train_lda_bbvi(bow_matrix, n_topics, alpha0=1.0, eta0=1.0, n_epochs=100, bat
     return model
 
 if __name__ == "__main__":
-    vocab_size = 500
+    vocab_size = 1000
     n_topics = 10
-    n_docs = 200
+    n_docs = 100
     doc_length = 70
     alpha0 = 0.1
     eta0 = 0.01

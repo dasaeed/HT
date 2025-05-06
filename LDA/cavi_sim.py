@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.special import digamma, loggamma
 from scipy.sparse import csr_matrix
@@ -364,15 +365,15 @@ class LDA:
 # Simple usage example
 if __name__ == "__main__":
     # Generate synthetic data
-    N = 1600       # Number of documents
-    N_test = 400   # Number of test documents
-    V = 10000      # Vocabulary size
-    K = 60       # Number of topics
+    N = 100       # Number of documents
+    N_test = 20   # Number of test documents
+    V = 1000      # Vocabulary size
+    K = 10       # Number of topics
     alpha0 = 0.1  # Symmetric Dirichlet parameter for topic proportions
     eta0 = 0.01   # Symmetric Dirichlet parameter for topics
     
     # Generate document lengths
-    Ms = np.random.poisson(300, size=N + N_test)
+    Ms = np.random.poisson(70, size=N + N_test)
     
     # Generate data
     i = 100
@@ -389,10 +390,10 @@ if __name__ == "__main__":
     
     # Fit LDA model
     lda = LDA(K=K, eta0=eta0, alpha0=alpha0, seed=i)
-    lda.fit(train_documents, train_nonzero_idxs, max_iterations=1000, tol=10, verbose=True)
+    lda.fit(train_documents, train_nonzero_idxs, max_iterations=1000, tol=0.1, verbose=True)
     
     # Plot ELBO
-    lda.plot_ELBO()
+    # lda.plot_ELBO()
     
     # Compute test likelihood
     test_likelihood = lda.compute_test_likelihood(test_documents, test_nonzero_idxs)
