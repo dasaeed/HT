@@ -1,1019 +1,357 @@
 import numpy as np
+import pandas as pd
+import time
 import torch
 import torch.distributions as dist
 import torch.nn.functional as F
-from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import StepLR
-from tqdm import tqdm
-import matplotlib
+from torch.optim import Adagrad
 import matplotlib.pyplot as plt
-matplotlib.rcParams["mathtext.fontset"] = "cm"
-matplotlib.rcParams["font.family"] = "STIXGeneral"
+from tqdm import tqdm
 
-class LDADataset(Dataset):
-    def __init__(self, bow_matrix):
-        self.bow_matrix = bow_matrix
-    
-    def __len__(self):
-        return self.bow_matrix.shape[0]
-    
-    def __getitem__(self, idx):
-        return self.bow_matrix[idx]
-    
-class LDABBVI(torch.nn.Module):
-    def __init__(self, vocab_size, n_topics, alpha0=1.0, eta0=1.0):
-        super(LDABBVI, self).__init__()
+class LDARBCVBBVI(torch.nn.Module):
+    def __init__(self, vocab_size, n_topics, alpha0=0.1, eta0=0.01):
+        super(LDARBCVBBVI, self).__init__()
         self.vocab_size = vocab_size
         self.n_topics = n_topics
         self.alpha0 = alpha0
         self.eta0 = eta0
+        self.epsilon = 1e-10
 
         # Log-parameterization for unconstrained optimization
-        self.topic_log_var = torch.nn.Parameter(
-            torch.randn(n_topics, vocab_size) * 0.01 + np.log(1.0 / vocab_size)
+        # Initialize close to uniform distribution for stability
+        self.lambda_topics = torch.nn.Parameter(
+            torch.zeros(n_topics, vocab_size) + np.log(1.0 / vocab_size)
         )
-        self.doc_log_var = None
+        self.gamma = None
         self.n_docs = None
+
+        # Cache for prior distributions
+        self._topic_prior = None
+        self._doc_prior = None
 
     def setup_doc_params(self, n_docs):
         self.n_docs = n_docs
-        self.doc_log_var = torch.nn.Parameter(
+        # Initialize close to uniform distribution for stability
+        self.gamma = torch.nn.Parameter(
             torch.zeros(n_docs, self.n_topics) + np.log(1.0 / self.n_topics)
         )
+        # Reset document prior for new batch
+        self._doc_prior = None
 
-    def get_topic_dist(self):
-        return torch.softmax(self.topic_log_var, dim=1)
-    
-    def get_doc_topic_prop(self):
-        return torch.softmax(self.doc_log_var, dim=1)
-    
     def get_var_params(self):
         # Apply softplus to ensure all values are positive
-        lambda_params = F.softplus(self.topic_log_var) + 1e-6
-        gamma_params = F.softplus(self.doc_log_var) + 1e-6
+        lambda_params = F.softplus(self.lambda_topics) + self.epsilon
+        gamma_params = F.softplus(self.gamma) + self.epsilon
         return lambda_params, gamma_params
     
-    def get_prior_dirichlets(self):
-        topic_prior = dist.Dirichlet(
-            torch.ones(self.vocab_size) * self.eta0
-        )
-        doc_prior = dist.Dirichlet(
-            torch.ones(self.n_topics) * self.alpha0
-        )
-        return topic_prior, doc_prior
-    
-    def get_var_dirichlets(self):
+    def get_topics(self):
+        return torch.softmax(self.lambda_topics, dim=1)
+
+    def topic_prior(self):
+        # Cache the topic prior distribution
+        if self._topic_prior is None:
+            self._topic_prior = dist.Dirichlet(torch.ones(self.vocab_size) * self.eta0)
+        return self._topic_prior
+
+    def doc_prior(self):
+        # Cache the document prior distribution
+        if self._doc_prior is None:
+            self._doc_prior = dist.Dirichlet(torch.ones(self.n_topics) * self.alpha0)
+        return self._doc_prior
+
+    def sample_variational(self, num_samples=1):
+        """Fully vectorized sampling for higher speed"""
         lambda_params, gamma_params = self.get_var_params()
-        topic_q = []
-        for k in range(self.n_topics):
-            topic_q.append(dist.Dirichlet(lambda_params[k]))
-        doc_q = []
-        for i in range(self.n_docs):
-            doc_q.append(dist.Dirichlet(gamma_params[i]))
-        return topic_q, doc_q
-    
+        
+        # Single call to rsample with a batch dimension for topics
+        topic_dist = dist.Dirichlet(lambda_params)
+        topics = topic_dist.rsample((num_samples,))  # Shape: [num_samples, n_topics, vocab_size]
+        
+        # Single call to rsample with a batch dimension for doc topics
+        doc_dist = dist.Dirichlet(gamma_params)
+        doc_topics = doc_dist.rsample((num_samples,))  # Shape: [num_samples, n_docs, n_topics]
+        
+        if num_samples == 1:
+            return topics.squeeze(0), doc_topics.squeeze(0)
+        else:
+            return topics, doc_topics
+
     def log_joint_prob(self, topics, doc_topics, docs):
-        topic_prior, doc_prior = self.get_prior_dirichlets()
-        log_p_topics = 0
-        for k in range(self.n_topics):
-            log_p_topics += topic_prior.log_prob(topics[k])
-        log_p_doc_topics = 0
-        for i in range(self.n_docs):
-            log_p_doc_topics += doc_prior.log_prob(doc_topics[i])
-        log_lik = 0
-        for i in range(self.n_docs):
-            word_probs = torch.matmul(doc_topics[i].unsqueeze(0), topics).squeeze(0)
-            mask = docs[i] > 0
-            if mask.sum() > 0:
-                log_lik += torch.sum(docs[i][mask] * torch.log(word_probs[mask] + 1e-10))
-        return log_p_topics + log_p_doc_topics + log_lik
-    
-    def elbo(self, docs, n_samples=10):
-        topic_q, doc_q = self.get_var_dirichlets()
-        elbo_val = 0
-        for _ in range(n_samples):
-            topics = torch.stack([topic_q[k].rsample() for k in range(self.n_topics)])
-            doc_topics = torch.stack([doc_q[i].rsample() for i in range(self.n_docs)])
-            log_joint = self.log_joint_prob(topics, doc_topics, docs)
-            log_q = 0
-            for k in range(self.n_topics):
-                log_q += topic_q[k].log_prob(topics[k])
-            for i in range(self.n_docs):
-                log_q += doc_q[i].log_prob(doc_topics[i])
-            elbo_val += log_joint - log_q
-        return elbo_val / n_samples
-    
-    def forward(self, docs, n_samples=10):
-        self.setup_doc_params(docs.shape[0])
-        return -self.elbo(docs, n_samples)
+        """Compute log joint probability with vectorized operations"""
+        # Log prior for topics - vectorized
+        topic_prior = self.topic_prior()
+        
+        # Handle different input shapes for topics
+        if topics.dim() == 2:  # Single sample
+            log_p_topics = topic_prior.log_prob(topics).sum()
+        else:  # Multiple samples: [num_samples, n_topics, vocab_size]
+            log_p_topics = torch.stack([topic_prior.log_prob(topics[i]).sum() for i in range(topics.shape[0])])
+        
+        # Log prior for topic proportions - vectorized
+        doc_prior = self.doc_prior()
+        
+        # Handle different input shapes for doc_topics
+        if doc_topics.dim() == 2:  # Single sample
+            log_p_doc_topics = doc_prior.log_prob(doc_topics).sum()
+        else:  # Multiple samples: [num_samples, n_docs, n_topics]
+            log_p_doc_topics = torch.stack([doc_prior.log_prob(doc_topics[i]).sum() for i in range(doc_topics.shape[0])])
+        
+        # Log likelihood for documents - vectorized matrix multiplication
+        # Shape: [n_docs, vocab_size] or [num_samples, n_docs, vocab_size]
+        if doc_topics.dim() == 2 and topics.dim() == 2:  # Single sample
+            word_probs = torch.matmul(doc_topics, topics)
+            mask = docs > 0
+            log_probs = torch.log(word_probs[mask] + self.epsilon)
+            log_lik = torch.sum(docs[mask] * log_probs)
+        else:  # Multiple samples
+            log_lik = torch.zeros(topics.shape[0], device=topics.device)
+            for i in range(topics.shape[0]):
+                word_probs = torch.matmul(doc_topics[i], topics[i])
+                mask = docs > 0
+                log_probs = torch.log(word_probs[mask] + self.epsilon)
+                log_lik[i] = torch.sum(docs[mask] * log_probs)
+        
+        if topics.dim() == 2:  # Single sample
+            return log_p_topics + log_p_doc_topics + log_lik
+        else:  # Multiple samples
+            return log_p_topics + log_p_doc_topics + log_lik
 
-class LDARBCVBBVI(LDABBVI):
-    """
-    LDA with Rao-Blackwellized Control Variate Black-Box Variational Inference
-    """
-    def __init__(self, vocab_size, n_topics, alpha0=1.0, eta0=1.0):
-        super(LDARBCVBBVI, self).__init__(vocab_size, n_topics, alpha0, eta0)
-    
-    def compute_score_function(self, latent_vars, robust=True):
-        """
-        Compute the score function (gradient of log q w.r.t. variational parameters)
-        for both topic and document variational parameters.
-        
-        Args:
-            latent_vars: Tuple of (topics, doc_topics)
-            robust: Whether to use robust computation with gradient clipping
-            
-        Returns:
-            Tuple of (topic_score, doc_score)
-        """
-        topics, doc_topics = latent_vars
+    def log_q(self, topics, doc_topics):
+        """Compute log of variational distribution with vectorized operations"""
         lambda_params, gamma_params = self.get_var_params()
         
-        # Score function for topic parameters
-        topic_score = []
-        for k in range(self.n_topics):
-            lambda_k = lambda_params[k]
-            lambda_sum = lambda_k.sum()
-            digamma_sum = torch.digamma(lambda_sum)
-            digamma_lambda = torch.digamma(lambda_k)
-            log_topics = torch.log(topics[k] + 1e-10)
-            
-            score_k = lambda_k * (digamma_sum - digamma_lambda + log_topics)
-            
-            if robust:
-                # Clip to avoid numerical instability
-                score_k = torch.clamp(score_k, -10.0, 10.0)
-                
-            topic_score.append(score_k)
+        # Log q for topics - vectorized
+        topic_dist = dist.Dirichlet(lambda_params)
         
-        # Score function for document parameters
-        doc_score = []
-        for i in range(self.n_docs):
-            gamma_i = gamma_params[i]
-            gamma_sum = gamma_i.sum()
-            digamma_sum = torch.digamma(gamma_sum)
-            digamma_gamma = torch.digamma(gamma_i)
-            log_doc_topics = torch.log(doc_topics[i] + 1e-10)
-            
-            score_i = gamma_i * (digamma_sum - digamma_gamma + log_doc_topics)
-            
-            if robust:
-                # Clip to avoid numerical instability
-                score_i = torch.clamp(score_i, -10.0, 10.0)
-                
-            doc_score.append(score_i)
-            
-        return topic_score, doc_score
+        # Handle different input shapes
+        if topics.dim() == 2:  # Single sample
+            log_q_topics = topic_dist.log_prob(topics).sum()
+        else:  # Multiple samples
+            log_q_topics = torch.stack([topic_dist.log_prob(topics[i]).sum() for i in range(topics.shape[0])])
+        
+        # Log q for topic proportions - vectorized
+        doc_dist = dist.Dirichlet(gamma_params)
+        
+        # Handle different input shapes
+        if doc_topics.dim() == 2:  # Single sample
+            log_q_doc_topics = doc_dist.log_prob(doc_topics).sum()
+        else:  # Multiple samples
+            log_q_doc_topics = torch.stack([doc_dist.log_prob(doc_topics[i]).sum() for i in range(doc_topics.shape[0])])
+        
+        return log_q_topics + log_q_doc_topics
     
-    def compute_elbo_gradient_estimate(self, docs, n_samples=10):
-        """
-        Compute gradient estimate of ELBO using Rao-Blackwellization and control variates
-        """
-        topic_q, doc_q = self.get_var_dirichlets()
-        lambda_params, gamma_params = self.get_var_params()
+    def elbo_loss(self, docs, n_samples=1):
+        """Compute negative ELBO loss with multiple samples for variance reduction"""
+        # Get samples in a vectorized manner
+        topics, doc_topics = self.sample_variational(n_samples)
         
-        # Initialize gradient accumulators
-        topic_grad = torch.zeros_like(self.topic_log_var)
-        doc_grad = torch.zeros_like(self.doc_log_var)
+        # Compute log joint and log q in a batch for all samples
+        log_joint = self.log_joint_prob(topics, doc_topics, docs)
+        log_q_val = self.log_q(topics, doc_topics)
         
-        # Data structures for samples and control variate computation
-        topic_samples = []  # Store samples to compute leave-one-out estimates
-        doc_samples = []
-        score_topic_samples = []  # Store score function values
-        score_doc_samples = []
-        elbo_samples = []  # Store ELBO values
+        # Compute ELBO
+        elbo = log_joint - log_q_val
         
-        # Generate samples and compute ELBO values
-        for s in range(n_samples):
-            # Sample from variational distribution
-            try:
-                topics = torch.stack([topic_q[k].rsample() for k in range(self.n_topics)])
-                doc_topics = torch.stack([doc_q[i].rsample() for i in range(self.n_docs)])
-            except ValueError as e:
-                # Handle potential sampling error
-                print(f"Sampling error: {e}")
-                # Return zero gradients in case of error
-                return torch.zeros_like(self.topic_log_var), torch.zeros_like(self.doc_log_var)
+        # Return negative mean ELBO (we want to maximize ELBO or minimize -ELBO)
+        return -torch.mean(elbo)
+    
+    def elbo_estimate(self, docs, n_samples=5):
+        """Compute ELBO estimate with Monte Carlo samples"""
+        with torch.no_grad():
+            # Get samples in a vectorized manner
+            topics, doc_topics = self.sample_variational(n_samples)
             
-            topic_samples.append(topics)
-            doc_samples.append(doc_topics)
-            
-            # Compute log joint probability (log p)
+            # Compute log joint and log q in a batch for all samples
             log_joint = self.log_joint_prob(topics, doc_topics, docs)
+            log_q_val = self.log_q(topics, doc_topics)
             
-            # Compute log variational distribution (log q)
-            log_q = 0
-            for k in range(self.n_topics):
-                log_q += topic_q[k].log_prob(topics[k])
-            for i in range(self.n_docs):
-                log_q += doc_q[i].log_prob(doc_topics[i])
-            
-            # Instantaneous ELBO = log p - log q
-            elbo_sample = log_joint - log_q
-            elbo_samples.append(elbo_sample)
-            
-            # Compute score function (gradient of log q wrt variational parameters)
-            topic_scores, doc_scores = self.compute_score_function((topics, doc_topics), robust=True)
-            
-            score_topic_samples.append(topic_scores)
-            score_doc_samples.append(doc_scores)
-        
-        # Compute leave-one-out control variate estimates for topic parameters
-        for k in range(self.n_topics):
-            for s in range(n_samples):
-                # Extract function values f = score * ELBO for all samples except s
-                f_values = []
-                h_values = []
-                
-                for j in range(n_samples):
-                    if j != s:
-                        f_values.append(score_topic_samples[j][k] * elbo_samples[j])
-                        h_values.append(score_topic_samples[j][k])
-                
-                # Compute optimal control variate coefficient
-                if len(f_values) > 0:
-                    try:
-                        f_tensor = torch.stack(f_values)
-                        h_tensor = torch.stack(h_values)
-                        
-                        f_mean = f_tensor.mean(dim=0)
-                        h_mean = h_tensor.mean(dim=0)
-                        
-                        # Covariance between f and h
-                        cov_f_h = ((f_tensor - f_mean) * (h_tensor - h_mean)).mean(dim=0)
-                        
-                        # Variance of h
-                        var_h = ((h_tensor - h_mean) ** 2).mean(dim=0)
-                        
-                        # Compute a* (with numerical stability)
-                        a_star = torch.zeros_like(var_h)
-                        mask = var_h > 1e-8
-                        a_star[mask] = cov_f_h[mask] / var_h[mask]
-                        
-                        # Ensure coefficient isn't too large
-                        a_star = torch.clamp(a_star, -5.0, 5.0)
-                        
-                        # Apply control variate
-                        f_s = score_topic_samples[s][k] * elbo_samples[s]
-                        h_s = score_topic_samples[s][k]
-                        
-                        # Control variate reduced gradient
-                        grad_s = f_s - a_star * h_s
-                        
-                        # Accumulate gradient (with safety clipping)
-                        grad_s = torch.clamp(grad_s, -10.0, 10.0)
-                        topic_grad[k] += grad_s / n_samples
-                    except Exception as e:
-                        print(f"Error in control variate computation for topic {k}: {e}")
-                        # Skip this sample
-                        continue
-        
-        # Compute leave-one-out control variate estimates for document parameters
-        for i in range(self.n_docs):
-            for s in range(n_samples):
-                # Extract function values f = score * ELBO for all samples except s
-                f_values = []
-                h_values = []
-                
-                for j in range(n_samples):
-                    if j != s:
-                        f_values.append(score_doc_samples[j][i] * elbo_samples[j])
-                        h_values.append(score_doc_samples[j][i])
-                
-                # Compute optimal control variate coefficient
-                if len(f_values) > 0:
-                    try:
-                        f_tensor = torch.stack(f_values)
-                        h_tensor = torch.stack(h_values)
-                        
-                        f_mean = f_tensor.mean(dim=0)
-                        h_mean = h_tensor.mean(dim=0)
-                        
-                        # Covariance between f and h
-                        cov_f_h = ((f_tensor - f_mean) * (h_tensor - h_mean)).mean(dim=0)
-                        
-                        # Variance of h
-                        var_h = ((h_tensor - h_mean) ** 2).mean(dim=0)
-                        
-                        # Compute a* (with numerical stability)
-                        a_star = torch.zeros_like(var_h)
-                        mask = var_h > 1e-8
-                        a_star[mask] = cov_f_h[mask] / var_h[mask]
-                        
-                        # Ensure coefficient isn't too large
-                        a_star = torch.clamp(a_star, -5.0, 5.0)
-                        
-                        # Apply control variate
-                        f_s = score_doc_samples[s][i] * elbo_samples[s]
-                        h_s = score_doc_samples[s][i]
-                        
-                        # Control variate reduced gradient
-                        grad_s = f_s - a_star * h_s
-                        
-                        # Accumulate gradient (with safety clipping)
-                        grad_s = torch.clamp(grad_s, -10.0, 10.0)
-                        doc_grad[i] += grad_s / n_samples
-                    except Exception as e:
-                        print(f"Error in control variate computation for document {i}: {e}")
-                        # Skip this sample
-                        continue
-        
-        return topic_grad, doc_grad
-    
-    def compute_cv_coefficient(self, f_samples, h_samples):
-        """
-        Compute optimal control variate coefficient:
-        a* = Cov(f, h) / Var(h)
-        """
-        # Skip computation if no samples
-        if len(f_samples) == 0 or len(h_samples) == 0:
-            return 0.0
-            
-        # Stack tensors for vectorized operations
-        try:
-            f = torch.stack(f_samples)
-            h = torch.stack(h_samples)
-        except:
-            # Handle case where tensors have different shapes
-            return torch.zeros_like(f_samples[0]) if f_samples else 0.0
-        
-        # Compute means
-        f_mean = f.mean(dim=0, keepdim=True)
-        h_mean = h.mean(dim=0, keepdim=True)
-        
-        # Compute covariance: Cov(f, h) = E[(f - E[f])(h - E[h])]
-        cov = ((f - f_mean) * (h - h_mean)).mean(dim=0)
-        
-        # Compute variance of h: Var(h) = E[(h - E[h])²]
-        var_h = ((h - h_mean) ** 2).mean(dim=0)
-        
-        # Compute optimal coefficient with numerical stability
-        # If variance is too small, set coefficient to zero to avoid instability
-        a = torch.zeros_like(var_h)
-        mask = var_h > 1e-8
-        a[mask] = cov[mask] / var_h[mask]
-        
-        # Ensure coefficient isn't too large
-        a = torch.clamp(a, -5.0, 5.0)
-        
-        return a
-        
-    def analyze_control_variate_effectiveness(self, docs, n_samples=100):
-        """
-        Analyze how well the control variates are working by computing variance reduction metrics
-        """
-        topic_q, doc_q = self.get_var_dirichlets()
-        lambda_params, gamma_params = self.get_var_params()
-        
-        # Collect raw gradient samples and control variate reduced samples
-        raw_gradients = []
-        cv_reduced_gradients = []
-        control_variate_coefficients = []
-        
-        for s in range(n_samples):
-            # Sample from variational distribution
-            try:
-                topics = torch.stack([topic_q[k].rsample() for k in range(self.n_topics)])
-                doc_topics = torch.stack([doc_q[i].rsample() for i in range(self.n_docs)])
-            except ValueError as e:
-                print(f"Sampling error in analysis: {e}")
-                continue
-            
-            # Compute log joint and log q
-            log_joint = self.log_joint_prob(topics, doc_topics, docs)
-            log_q = sum(topic_q[k].log_prob(topics[k]) for k in range(self.n_topics)) + \
-                   sum(doc_q[i].log_prob(doc_topics[i]) for i in range(self.n_docs))
-            
-            # ELBO for this sample
-            elbo_sample = log_joint - log_q
-            
-            # Compute score function for one topic parameter (for analysis)
-            k = 0  # Analyze first topic
-            lambda_k = lambda_params[k]
-            lambda_sum = lambda_k.sum()
-            digamma_sum = torch.digamma(lambda_sum)
-            digamma_lambda = torch.digamma(lambda_k)
-            log_topics_k = torch.log(topics[k] + 1e-10)
-            score_k = lambda_k * (digamma_sum - digamma_lambda + log_topics_k)
-            
-            # Clip to avoid numerical issues
-            score_k = torch.clamp(score_k, -10.0, 10.0)
-            
-            # Raw gradient (without control variate)
-            raw_grad = score_k * elbo_sample
-            raw_gradients.append(raw_grad.detach())
-            
-            # Store for control variate computation
-            if s % 10 == 0 and len(raw_gradients) > 1:  # Compute CV coefficient less frequently
-                try:
-                    cv_coeff = self.compute_cv_coefficient(
-                        raw_gradients[:-1], 
-                        [g / elbo_sample if torch.abs(elbo_sample) > 1e-10 else g for g in raw_gradients[:-1]]
-                    )
-                    control_variate_coefficients.append(cv_coeff.detach())
-                    
-                    # Apply control variate
-                    cv_grad = raw_grad - cv_coeff * score_k
-                    cv_reduced_gradients.append(cv_grad.detach())
-                except Exception as e:
-                    print(f"Error in CV analysis: {e}")
-                    continue
-        
-        # Analyze variance reduction
-        if len(raw_gradients) == 0:
-            print("No valid samples for variance analysis")
-            return {'raw_variance': None, 'cv_variance': None, 'variance_reduction': None}
-            
-        try:
-            raw_var = torch.stack(raw_gradients).var(dim=0)
-            cv_var = torch.stack(cv_reduced_gradients).var(dim=0) if cv_reduced_gradients else None
-        
-            # Plot analysis
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-            
-            # Plot raw gradient samples
-            raw_grads_np = torch.stack(raw_gradients).numpy()
-            ax1.plot(raw_grads_np[:, :10])  # Show first 10 dimensions
-            ax1.set_title("Raw Gradient Samples (First 10 Dims)")
-            ax1.set_xlabel("Sample")
-            ax1.set_ylabel("Gradient Value")
-            
-            # Plot CV-reduced gradient samples
-            if cv_reduced_gradients:
-                cv_grads_np = torch.stack(cv_reduced_gradients).numpy()
-                ax2.plot(cv_grads_np[:, :10])  # Show first 10 dimensions
-                ax2.set_title("CV-Reduced Gradient Samples (First 10 Dims)")
-                ax2.set_xlabel("Sample")
-                ax2.set_ylabel("Gradient Value")
-            
-            # Plot variance reduction
-            if cv_var is not None:
-                reduction = (raw_var - cv_var) / raw_var
-                ax3.bar(range(10), reduction[:10].numpy())
-                ax3.set_title("Variance Reduction (First 10 Dims)")
-                ax3.set_xlabel("Dimension")
-                ax3.set_ylabel("Relative Variance Reduction")
-                ax3.axhline(y=0, color='r', linestyle='--')
-            
-            # Plot control variate coefficients
-            if control_variate_coefficients:
-                cv_coeffs_np = torch.stack(control_variate_coefficients).numpy()
-                ax4.plot(cv_coeffs_np[:, :10])  # Show first 10 dimensions
-                ax4.set_title("Control Variate Coefficients (First 10 Dims)")
-                ax4.set_xlabel("Iteration")
-                ax4.set_ylabel("CV Coefficient")
-            
-            plt.tight_layout()
-            plt.show()
-            
-            # Return metrics
-            return {
-                'raw_variance': raw_var.mean().item(),
-                'cv_variance': cv_var.mean().item() if cv_var is not None else None,
-                'variance_reduction': ((raw_var - cv_var) / raw_var).mean().item() if cv_var is not None else None
-            }
-        except Exception as e:
-            print(f"Error in variance analysis: {e}")
-            return {'raw_variance': None, 'cv_variance': None, 'variance_reduction': None}
+            # Compute and return mean ELBO
+            elbo = torch.mean(log_joint - log_q_val)
+            return elbo  # Return tensor, not item()
 
-def generate_lda_data(vocab_size, n_topics, n_docs, doc_length, alpha0=1.0, eta0=1.0):
+def generate_lda_data(vocab_size, n_topics, n_docs, doc_length, alpha0=0.1, eta0=0.01, seed=42):
+    """Generate synthetic LDA data"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Generate true topics
     true_topics = np.zeros((n_topics, vocab_size))
     for k in range(n_topics):
         true_topics[k] = np.random.dirichlet(np.ones(vocab_size) * eta0)
-    documents = np.zeros((n_docs, vocab_size), dtype=int)
+    
+    # Generate documents - vectorized where possible
+    documents = np.zeros((n_docs, vocab_size), dtype=np.int32)
     true_doc_topics = np.zeros((n_docs, n_topics))
+    
     for d in range(n_docs):
+        # Draw topic proportions
         theta = np.random.dirichlet(np.ones(n_topics) * alpha0)
         true_doc_topics[d] = theta
+        
+        # Generate document
         doc_len = np.random.poisson(doc_length)
-        for _ in range(doc_len):
-            z = np.random.choice(n_topics, p=theta)
+        topic_assignments = np.random.choice(n_topics, size=doc_len, p=theta)
+        
+        # Count words
+        for z in topic_assignments:
             w = np.random.choice(vocab_size, p=true_topics[z])
             documents[d, w] += 1
+    
     return documents, true_topics, true_doc_topics
 
-def train_lda_rbcv_bbvi(bow_matrix, n_topics, alpha0=1.0, eta0=1.0, n_epochs=100, batch_size=32, lr=0.01, n_samples=10, use_adam_state=True):
-    vocab_size = bow_matrix.shape[1]
-    dataset = LDADataset(bow_matrix)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def train_rbcv_bbvi(docs, n_topics, alpha0=0.1, eta0=0.01, n_iterations=600, 
+                    initial_lr=0.1, n_samples=50, device='cpu',
+                    scheduler_step_size=100, scheduler_gamma=0.5):
+    """
+    Train LDA model with RBCV-BBVI using PyTorch's autograd, AdaGrad, and learning rate scheduling
+    """
+    # Move data to specified device
+    docs = docs.to(device)
     
-    # Initialize model with RBCV BBVI
-    model = LDARBCVBBVI(vocab_size, n_topics, alpha0, eta0)
+    vocab_size = docs.shape[1]
+    n_docs = docs.shape[0]
     
-    # Create optimizers
-    if use_adam_state:
-        # Regular Adam optimizer with smaller learning rate for stability
-        topic_optimizer = Adam([{"params": model.topic_log_var}], lr=lr)
-    else:
-        # SGD for manual gradient updates (use smaller learning rate for SGD)
-        topic_optimizer = torch.optim.SGD([{"params": model.topic_log_var}], lr=lr * 0.1)
+    # Initialize model and move to device
+    model = LDARBCVBBVI(vocab_size, n_topics, alpha0, eta0).to(device)
+    model.setup_doc_params(n_docs)
     
-    scheduler = StepLR(topic_optimizer, step_size=10, gamma=0.9)
+    # Initialize optimizers with AdaGrad
+    topic_optimizer = Adagrad([model.lambda_topics], lr=initial_lr, weight_decay=1e-5)
+    doc_optimizer = Adagrad([model.gamma], lr=initial_lr*2, weight_decay=1e-5)
     
-    elbo_history = []
-    variance_history = []  # Track variance of gradient estimates
+    # Add learning rate schedulers
+    topic_scheduler = torch.optim.lr_scheduler.StepLR(
+        topic_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
+    doc_scheduler = torch.optim.lr_scheduler.StepLR(
+        doc_optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
     
-    for epoch in tqdm(range(n_epochs)):
-        epoch_elbo = 0
-        epoch_variance = 0
+    # Initialize tracking variables
+    elbo_values = []
+    lr_values = []  # We'll keep this for AdaGrad's effective rate
+    
+    # Training loop
+    for iteration in tqdm(range(n_iterations)):
+        # Multiple updates for document parameters
+        for _ in range(2):
+            doc_optimizer.zero_grad()
+            loss = model.elbo_loss(docs, n_samples=n_samples//2)
+            loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(model.gamma, 5.0)
+            doc_optimizer.step()
         
-        for batch_idx, docs in enumerate(dataloader):
-            # Set up document parameters for this batch
-            model.setup_doc_params(docs.shape[0])
-            
-            # Optimizer for document parameters
-            if use_adam_state:
-                doc_optimizer = Adam([model.doc_log_var], lr=lr)
-            else:
-                # SGD with smaller learning rate
-                doc_optimizer = torch.optim.SGD([model.doc_log_var], lr=lr * 0.1)
-            
-            # Optimize document parameters with multiple steps
-            for _ in range(5):
-                # Important: Zero out gradients before computation
-                doc_optimizer.zero_grad()
-                
-                try:
-                    # Compute RBCV gradient estimates for document parameters
-                    _, doc_grad = model.compute_elbo_gradient_estimate(docs, n_samples)
-                    
-                    if use_adam_state:
-                        # Set gradients for Adam to use its internal state
-                        model.doc_log_var.grad = doc_grad
-                        doc_optimizer.step()
-                    else:
-                        # Direct parameter update for SGD with gradient clipping
-                        with torch.no_grad():
-                            # Clip gradients to prevent extreme values
-                            doc_grad_clipped = torch.clamp(doc_grad, -1.0, 1.0)
-                            model.doc_log_var.data += lr * 0.1 * doc_grad_clipped
-                except Exception as e:
-                    print(f"Error in document parameter optimization (batch {batch_idx}): {e}")
-                    continue  # Skip this step if there's an error
-            
-            # Optimize topic parameters
-            topic_optimizer.zero_grad()
-            
-            try:
-                # Compute RBCV gradient estimates for topic parameters
-                topic_grad, _ = model.compute_elbo_gradient_estimate(docs, n_samples)
-                
-                # Track gradient variance
-                grad_norm = torch.norm(topic_grad).item()
-                epoch_variance += grad_norm
-                
-                if use_adam_state:
-                    # Set gradients for Adam to use its internal state
-                    model.topic_log_var.grad = topic_grad
-                    topic_optimizer.step()
-                else:
-                    # Direct parameter update for SGD with gradient clipping
-                    with torch.no_grad():
-                        # Clip gradients to prevent extreme values
-                        topic_grad_clipped = torch.clamp(topic_grad, -1.0, 1.0)
-                        model.topic_log_var.data += lr * 0.1 * topic_grad_clipped
-            except Exception as e:
-                print(f"Error in topic parameter optimization (batch {batch_idx}): {e}")
-                continue  # Skip this step if there's an error
-            
-            # Compute ELBO for monitoring (ELBO is the negative of the loss from forward)
-            with torch.no_grad():
-                try:
-                    elbo_val = -model(docs, n_samples=5).item()  # Use fewer samples for evaluation
-                    epoch_elbo += elbo_val
-                except Exception as e:
-                    print(f"Error computing ELBO (batch {batch_idx}): {e}")
-                    continue
+        # Update topic parameters
+        topic_optimizer.zero_grad()
+        loss = model.elbo_loss(docs, n_samples=n_samples)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.lambda_topics, 5.0)
+        topic_optimizer.step()
         
-        # Update learning rate
-        scheduler.step()
+        # Step the learning rate schedulers
+        topic_scheduler.step()
+        doc_scheduler.step()
         
-        # Average ELBO over batches
-        avg_elbo = epoch_elbo / max(len(dataloader), 1)  # Avoid division by zero
-        avg_variance = epoch_variance / max(len(dataloader), 1)  # Avoid division by zero
-        elbo_history.append(avg_elbo)
-        variance_history.append(avg_variance)
+        # Compute and store ELBO at current iteration
+        with torch.no_grad():
+            elbo_val = model.elbo_estimate(docs, n_samples=5).item()
+            elbo_values.append((iteration, elbo_val))
         
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{n_epochs}, ELBO: {avg_elbo:.4f}, Grad Variance: {avg_variance:.4f}")
+        # Track AdaGrad effective learning rates (approximation using first parameter)
+        if hasattr(topic_optimizer, 'param_groups') and len(topic_optimizer.param_groups) > 0:
+            param_state = list(topic_optimizer.state.values())[0] if topic_optimizer.state else {}
+            if 'sum' in param_state:
+                effective_lr = initial_lr / (torch.sqrt(param_state['sum'][0, 0]) + topic_optimizer.defaults['eps'])
+                lr_values.append((iteration, effective_lr.item()))
+        
+        # Print progress
+        if (iteration + 1) % 25 == 0:
+            current_elbo = elbo_values[-1][1] if elbo_values else 0
+            print(f"Iteration {iteration+1}/{n_iterations}, ELBO: {current_elbo:.2f}")
     
-    # Plot ELBO history
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-    
-    ax1.plot(elbo_history)
-    ax1.set_title("ELBO Convergence with RBCV BBVI")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("ELBO")
-    ax1.grid(True)
-    
-    ax2.plot(variance_history)
-    ax2.set_title("Gradient Variance")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Gradient Norm")
-    ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    return model, elbo_history, variance_history
+    return model, elbo_values, lr_values
 
-def train_lda_bbvi_with_history(bow_matrix, n_topics, alpha0=1.0, eta0=1.0, n_epochs=100, batch_size=32, lr=0.01):
-    vocab_size = bow_matrix.shape[1]
-    dataset = LDADataset(bow_matrix)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model = LDABBVI(vocab_size, n_topics, alpha0, eta0)
-    optimizer = Adam([{"params": model.topic_log_var}], lr=lr)
-    scheduler = StepLR(optimizer, step_size=10, gamma=0.9)
-    elbo_history = []
-    
-    for epoch in tqdm(range(n_epochs)):
-        epoch_elbo = 0
-        for batch_idx, docs in enumerate(dataloader):
-            optimizer.zero_grad()
-            model.setup_doc_params(docs.shape[0])
-            doc_optimizer = Adam([model.doc_log_var], lr=lr)
-            for _ in range(5):
-                doc_optimizer.zero_grad()
-                loss = model(docs)
-                loss.backward(retain_graph=True)
-                doc_optimizer.step()
-            loss = model(docs)
-            loss.backward()
-            optimizer.step()
-            epoch_elbo -= loss.item()
-            scheduler.step()
-        
-        avg_elbo = epoch_elbo / max(len(dataloader), 1)  # Avoid division by zero
-        elbo_history.append(avg_elbo)
 
-        if (epoch +1) % 10 == 0:
-            print(f"Vanilla BBVI - Epoch {epoch+1}/{n_epochs}, ELBO: {avg_elbo:.4f}")
+def main():
+    # Check if CUDA is available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    return model, elbo_history
-
-def compare_vanilla_and_rbcv_bbvi(documents, n_topics, alpha0, eta0, n_epochs=200, batch_size=32, lr=0.01):
-    """
-    Run both vanilla BBVI and RBCV BBVI with same data and parameters, and compare results
-    """
-    # Convert to tensor if not already
-    if not isinstance(documents, torch.Tensor):
-        documents = torch.tensor(documents, dtype=torch.float32)
-    
-    # Train with vanilla BBVI
-    print("Training LDA model with vanilla BBVI...")
-    vanilla_model, vanilla_elbo_history = train_lda_bbvi_with_history(
-        documents,
-        n_topics=n_topics,
-        alpha0=alpha0,
-        eta0=eta0,
-        n_epochs=n_epochs,
-        batch_size=batch_size,
-        lr=lr
-    )
-    
-    # Train with RBCV BBVI using Adam
-    print("\nTraining LDA model with RBCV BBVI (Adam)...")
-    rbcv_model_adam, rbcv_elbo_history_adam, rbcv_variance_adam = train_lda_rbcv_bbvi(
-        documents,
-        n_topics=n_topics,
-        alpha0=alpha0,
-        eta0=eta0,
-        n_epochs=n_epochs,
-        batch_size=batch_size,
-        lr=lr,
-        n_samples=10,
-        use_adam_state=True
-    )
-    
-    # Train with RBCV BBVI using SGD
-    print("\nTraining LDA model with RBCV BBVI (SGD)...")
-    rbcv_model_sgd, rbcv_elbo_history_sgd, rbcv_variance_sgd = train_lda_rbcv_bbvi(
-        documents,
-        n_topics=n_topics,
-        alpha0=alpha0,
-        eta0=eta0,
-        n_epochs=n_epochs,
-        batch_size=batch_size,
-        lr=lr,
-        n_samples=10,
-        use_adam_state=False
-    )
-    
-    # Plot comparison of ELBO convergence
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
-    
-    # ELBO comparison
-    ax1.plot(vanilla_elbo_history, label='Vanilla BBVI')
-    ax1.plot(rbcv_elbo_history_adam, label='RBCV BBVI (Adam)')
-    ax1.plot(rbcv_elbo_history_sgd, label='RBCV BBVI (SGD)')
-    ax1.set_title("ELBO Convergence Comparison")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("ELBO")
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Variance comparison
-    ax2.plot(rbcv_variance_adam, label='RBCV BBVI (Adam)')
-    ax2.plot(rbcv_variance_sgd, label='RBCV BBVI (SGD)')
-    ax2.set_title("Gradient Variance Comparison")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Gradient Norm")
-    ax2.legend()
-    ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Plot relative improvement
-    plt.figure(figsize=(10, 6))
-    epochs = np.arange(len(vanilla_elbo_history))
-    relative_improvement_adam = (np.array(rbcv_elbo_history_adam) - np.array(vanilla_elbo_history)) / np.abs(np.array(vanilla_elbo_history))
-    relative_improvement_sgd = (np.array(rbcv_elbo_history_sgd) - np.array(vanilla_elbo_history)) / np.abs(np.array(vanilla_elbo_history))
-    
-    plt.plot(epochs, relative_improvement_adam * 100, label='RBCV BBVI (Adam) vs Vanilla')
-    plt.plot(epochs, relative_improvement_sgd * 100, label='RBCV BBVI (SGD) vs Vanilla')
-    plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-    plt.title("Relative Improvement of RBCV BBVI over Vanilla BBVI")
-    plt.xlabel("Epoch")
-    plt.ylabel("Relative Improvement (%)")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-    
-    return vanilla_model, rbcv_model_adam, rbcv_model_sgd, vanilla_elbo_history, rbcv_elbo_history_adam, rbcv_elbo_history_sgd
-
-def step_size_analysis(documents, n_topics, alpha0, eta0, learning_rates=[0.001, 0.01, 0.05, 0.1], n_epochs=50, batch_size=32):
-    """
-    Analyze the effect of different step sizes on RBCV BBVI performance
-    """
-    if not isinstance(documents, torch.Tensor):
-        documents = torch.tensor(documents, dtype=torch.float32)
-    
-    # Compare with both Adam and SGD
-    fig, axs = plt.subplots(2, 1, figsize=(12, 10))
-    
-    # Results storage
-    adam_results = {}
-    sgd_results = {}
-    
-    # Test each learning rate
-    for lr in learning_rates:
-        print(f"\nTesting learning rate: {lr}")
-        
-        # Train with RBCV BBVI using Adam
-        print(f"  Training with Adam...")
-        _, rbcv_elbo_adam, _ = train_lda_rbcv_bbvi(
-            documents,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            n_samples=10,
-            use_adam_state=True
-        )
-        adam_results[lr] = rbcv_elbo_adam
-        
-        # Train with RBCV BBVI using SGD
-        print(f"  Training with SGD...")
-        _, rbcv_elbo_sgd, _ = train_lda_rbcv_bbvi(
-            documents,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            n_samples=10,
-            use_adam_state=False
-        )
-        sgd_results[lr] = rbcv_elbo_sgd
-    
-    # Plot results for Adam
-    for lr, elbo in adam_results.items():
-        axs[0].plot(elbo, label=f'lr={lr}')
-    axs[0].set_title("RBCV BBVI with Adam Optimizer")
-    axs[0].set_xlabel("Epoch")
-    axs[0].set_ylabel("ELBO")
-    axs[0].legend()
-    axs[0].grid(True)
-    
-    # Plot results for SGD
-    for lr, elbo in sgd_results.items():
-        axs[1].plot(elbo, label=f'lr={lr}')
-    axs[1].set_title("RBCV BBVI with SGD Optimizer")
-    axs[1].set_xlabel("Epoch")
-    axs[1].set_ylabel("ELBO")
-    axs[1].legend()
-    axs[1].grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Return best results
-    best_lr_adam = max(adam_results.items(), key=lambda x: x[1][-1])[0]
-    best_lr_sgd = max(sgd_results.items(), key=lambda x: x[1][-1])[0]
-    
-    print(f"\nBest learning rate for Adam: {best_lr_adam} (Final ELBO: {adam_results[best_lr_adam][-1]:.4f})")
-    print(f"Best learning rate for SGD: {best_lr_sgd} (Final ELBO: {sgd_results[best_lr_sgd][-1]:.4f})")
-    
-    return adam_results, sgd_results
-
-def samples_analysis(documents, n_topics, alpha0, eta0, n_samples_list=[5, 10, 20, 50], n_epochs=50, batch_size=32, lr=0.01):
-    """
-    Analyze the effect of different numbers of Monte Carlo samples on RBCV BBVI performance
-    """
-    if not isinstance(documents, torch.Tensor):
-        documents = torch.tensor(documents, dtype=torch.float32)
-    
-    # Results storage
-    results = {}
-    variance_results = {}
-    
-    # Test each number of samples
-    for n_samples in n_samples_list:
-        print(f"\nTesting with {n_samples} Monte Carlo samples")
-        
-        # Train with RBCV BBVI
-        _, elbo_history, variance_history = train_lda_rbcv_bbvi(
-            documents,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            n_samples=n_samples,
-            use_adam_state=True
-        )
-        results[n_samples] = elbo_history
-        variance_results[n_samples] = variance_history
-    
-    # Plot results
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Plot ELBO
-    for n_samples, elbo in results.items():
-        ax1.plot(elbo, label=f'samples={n_samples}')
-    ax1.set_title("Effect of Number of Monte Carlo Samples on ELBO")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("ELBO")
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Plot gradient variance
-    for n_samples, variance in variance_results.items():
-        ax2.plot(variance, label=f'samples={n_samples}')
-    ax2.set_title("Effect of Number of Monte Carlo Samples on Gradient Variance")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Gradient Norm")
-    ax2.legend()
-    ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Return best results
-    best_n_samples = max(results.items(), key=lambda x: x[1][-1])[0]
-    print(f"\nBest number of samples: {best_n_samples} (Final ELBO: {results[best_n_samples][-1]:.4f})")
-    
-    return results, variance_results
-
-def evaluate_topics(model, true_topics, vocabulary=None):
-    """
-    Evaluate the learned topics against true topics using topic coherence
-    and visualize the top words for each topic
-    """
-    learned_topics = model.get_topic_dist().detach().numpy()
-    n_topics = learned_topics.shape[0]
-    
-    if vocabulary is None:
-        vocabulary = [f"word_{i}" for i in range(learned_topics.shape[1])]
-    
-    # Visualize top words for each topic
-    top_k = 10
-    fig, axs = plt.subplots(n_topics, 2, figsize=(15, 3*n_topics))
-    
-    for k in range(n_topics):
-        # True topic
-        true_top_idx = np.argsort(-true_topics[k])[:top_k]
-        true_top_words = [vocabulary[idx] for idx in true_top_idx]
-        true_weights = true_topics[k][true_top_idx]
-        
-        # Learned topic
-        learned_top_idx = np.argsort(-learned_topics[k])[:top_k]
-        learned_top_words = [vocabulary[idx] for idx in learned_top_idx]
-        learned_weights = learned_topics[k][learned_top_idx]
-        
-        # Plot true topic
-        axs[k, 0].barh(range(top_k), true_weights, align='center')
-        axs[k, 0].set_yticks(range(top_k))
-        axs[k, 0].set_yticklabels(true_top_words)
-        axs[k, 0].set_title(f"True Topic {k+1}")
-        
-        # Plot learned topic
-        axs[k, 1].barh(range(top_k), learned_weights, align='center')
-        axs[k, 1].set_yticks(range(top_k))
-        axs[k, 1].set_yticklabels(learned_top_words)
-        axs[k, 1].set_title(f"Learned Topic {k+1}")
-    
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    # Parameters for synthetic data generation
+    # Parameters
     vocab_size = 500
-    n_topics = 10
-    n_docs = 200
-    doc_length = 70
+    n_topics = 5
+    n_docs = 50
+    doc_length = 100
     alpha0 = 0.1
     eta0 = 0.01
+    n_iterations = 10000
+    initial_lr = 0.09
+    n_samples = 30
+    
+    # Scheduler parameters
+    scheduler_step_size = 200  # Number of iterations before reducing learning rate
+    scheduler_gamma = 0.5      # Factor by which to reduce learning rate
+    
+    # Set random seeds for reproducibility
+    np.random.seed(42)
+    torch.manual_seed(42)
     
     # Generate synthetic data
     print("Generating synthetic LDA data...")
     documents, true_topics, true_doc_topics = generate_lda_data(
         vocab_size, n_topics, n_docs, doc_length, alpha0, eta0
     )
-    documents_tensor = torch.tensor(documents, dtype=torch.float32)
+    docs = torch.tensor(documents, dtype=torch.float32)
     
-    # Analysis choice menu
-    print("\nChoose analysis to run:")
-    print("1. Compare vanilla BBVI and RBCV BBVI (Adam and SGD)")
-    print("2. Analyze control variate effectiveness")
-    print("3. Analyze effect of learning rate")
-    print("4. Analyze effect of number of Monte Carlo samples")
+    # Train model with RBCV-BBVI using AdaGrad and learning rate scheduling
+    print("Training LDA model with RBCV-BBVI using AdaGrad and learning rate scheduling...")
+    start = time.time()
+    model, elbo_values, lr_values = train_rbcv_bbvi(
+        docs, n_topics, alpha0, eta0, n_iterations, initial_lr, n_samples, device,
+        scheduler_step_size, scheduler_gamma
+    )
+    stop = time.time()
     
-    choice = input("Enter choice (1-4): ")
+    # Extract iteration and ELBO values for plotting
+    iterations, elbos = zip(*elbo_values)
+    time_steps = np.linspace(0, stop-start, len(elbos))
+    df = pd.DataFrame({"elbo": elbos, "time_steps": time_steps})
+    df.to_csv("rbcv_bbvi_dataset.csv")
     
-    if choice == '1':
-        # Compare vanilla BBVI and RBCV BBVI with different optimizers
-        print("Running comparison between vanilla BBVI and RBCV BBVI...")
-        vanilla_model, rbcv_model_adam, rbcv_model_sgd, vanilla_elbo, rbcv_elbo_adam, rbcv_elbo_sgd = compare_vanilla_and_rbcv_bbvi(
-            documents,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            n_epochs=100,
-            batch_size=32,
-            lr=0.01
-        )
-        
-        # Evaluate topics
-        print("\nComparing learned topics:")
-        print("Vanilla BBVI:")
-        evaluate_topics(vanilla_model, true_topics)
-        print("\nRBCV BBVI (Adam):")
-        evaluate_topics(rbcv_model_adam, true_topics)
-        print("\nRBCV BBVI (SGD):")
-        evaluate_topics(rbcv_model_sgd, true_topics)
-        
-    elif choice == '2':
-        # Analyze control variate effectiveness
-        print("Analyzing control variate effectiveness...")
-        model = LDARBCVBBVI(vocab_size, n_topics, alpha0, eta0)
-        model.setup_doc_params(documents_tensor.shape[0])
-        
-        # Initialize parameters
-        with torch.no_grad():
-            # Initialize with non-random values for consistency
-            model.topic_log_var.data = torch.zeros_like(model.topic_log_var) + np.log(1.0 / vocab_size)
-            model.doc_log_var.data = torch.zeros_like(model.doc_log_var) + np.log(1.0 / n_topics)
-        
-        # Analyze
-        metrics = model.analyze_control_variate_effectiveness(documents_tensor, n_samples=100)
-        print("\nVariance Reduction Metrics:")
-        print(f"Raw gradient variance: {metrics['raw_variance']:.6f}")
-        print(f"CV-reduced gradient variance: {metrics['cv_variance']:.6f}")
-        print(f"Relative variance reduction: {metrics['variance_reduction']*100:.2f}%")
-        
-    elif choice == '3':
-        # Analyze effect of learning rate
-        print("Analyzing effect of learning rate...")
-        adam_results, sgd_results = step_size_analysis(
-            documents_tensor,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            learning_rates=[0.001, 0.005, 0.01, 0.05, 0.1],
-            n_epochs=50,
-            batch_size=32
-        )
-        
-    elif choice == '4':
-        # Analyze effect of number of Monte Carlo samples
-        print("Analyzing effect of number of Monte Carlo samples...")
-        elbo_results, variance_results = samples_analysis(
-            documents_tensor,
-            n_topics=n_topics,
-            alpha0=alpha0,
-            eta0=eta0,
-            n_samples_list=[5, 10, 20, 50],
-            n_epochs=50,
-            batch_size=32,
-            lr=0.01
-        )
-        
+    # Apply moving average to smooth the plot
+    window_size = 10
+    if len(elbos) > window_size:
+        elbo_smoothed = np.convolve(elbos, np.ones(window_size)/window_size, mode='valid')
+        smooth_iterations = iterations[window_size-1:len(iterations)]
     else:
-        print("Invalid choice. Exiting.")
+        elbo_smoothed = elbos
+        smooth_iterations = iterations
+    
+    # Plot ELBO trace
+    plt.figure(figsize=(10, 6))
+    plt.plot(iterations, elbos, 'o-', alpha=0.4, label='Raw ELBO')
+    plt.plot(smooth_iterations, elbo_smoothed, 'r-', linewidth=2, label='Smoothed ELBO')
+    plt.title('ELBO Convergence with RBCV-BBVI using AdaGrad + Scheduler')
+    plt.xlabel('Iteration')
+    plt.ylabel('ELBO')
+    plt.grid(True)
+    plt.legend()
+    # plt.savefig('rbcv_bbvi_elbo_trace.png')
+    plt.show()
+    
+    # Plot AdaGrad effective learning rate if values were tracked
+    if lr_values:
+        lr_iterations, lr_rates = zip(*lr_values)
+        plt.figure(figsize=(10, 4))
+        plt.plot(lr_iterations, lr_rates)
+        plt.title('AdaGrad Effective Learning Rate with Scheduler')
+        plt.xlabel('Iteration')
+        plt.ylabel('Effective Learning Rate')
+        plt.grid(True)
+        plt.yscale('log')
+        # plt.savefig('adagrad_lr_trace.png')
+        plt.show()
+        print("AdaGrad learning rate plot saved as 'adagrad_lr_trace.png'")
+    
+    print("ELBO trace plot saved as 'rbcv_bbvi_elbo_trace.png'")
+
+if __name__ == "__main__":
+    main()
