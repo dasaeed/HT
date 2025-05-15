@@ -169,6 +169,64 @@ class LDABBVI(torch.nn.Module):
         
         return score
 
+    def compute_predictive_likelihood(self, test_docs):
+        """
+        Compute the predictive log-likelihood on test documents using point estimates
+        of the variational parameters.
+        
+        Parameters:
+        -----------
+        test_docs : torch.Tensor
+            Test document-term matrix, shape [n_test_docs, vocab_size]
+        
+        Returns:
+        --------
+        float
+            Total predictive log-likelihood on test set
+        dict
+            Dictionary containing additional metrics including per-word likelihood
+        """
+        # Get device
+        device = next(self.parameters()).device
+        test_docs = test_docs.to(device)
+        
+        # Get the variational parameters
+        lambda_params, gamma_params = self.get_var_params()
+        
+        # Normalize parameters to get point estimates
+        # hat_beta is the normalized topic-word probabilities
+        hat_beta = lambda_params / torch.sum(lambda_params, dim=1, keepdim=True)
+        
+        # Get average topic proportions from training data
+        hat_theta_avg = torch.mean(gamma_params / torch.sum(gamma_params, dim=1, keepdim=True), dim=0)
+        
+        N_test, V = test_docs.shape
+        
+        # Initialize total log-likelihood and word count
+        log_test_lik = 0.0
+        total_words = 0
+        
+        # Compute log-likelihood for each test document
+        for i in range(N_test):
+            doc = test_docs[i]
+            nonzero_idx = torch.nonzero(doc).squeeze(1)
+            
+            # Skip empty documents
+            if nonzero_idx.numel() == 0:
+                continue
+            
+            # For each word occurrence in the document
+            for idx in nonzero_idx:
+                # Document-topic * topic-word probability
+                word_prob = torch.dot(hat_theta_avg, hat_beta[:, idx])
+                
+                # Add to log-likelihood (weighted by word count)
+                count = doc[idx].item()
+                total_words += count
+                log_test_lik += count * torch.log(word_prob + self.epsilon)
+        
+        return log_test_lik.item()
+
 
 def generate_lda_data(vocab_size, n_topics, n_docs, doc_length, alpha0=0.1, eta0=0.01, seed=42):
     """Generate synthetic LDA data"""
@@ -321,18 +379,18 @@ def main():
     doc_length = 100
     alpha0 = 0.1
     eta0 = 0.01
-    n_iterations = 10000
-    initial_lr = 0.11
-    n_samples = 10  # Number of samples for score function estimator
+    n_iterations = 700
+    initial_lr = 0.15
+    n_samples = 20  # Number of samples for score function estimator
     
     # Scheduler parameters
-    scheduler_step_size = 200
-    scheduler_gamma = 0.5
+    scheduler_step_size = 150
+    scheduler_gamma = 0.35
 
     
     # Set random seeds for reproducibility
-    np.random.seed(42)
-    torch.manual_seed(42)
+    # np.random.seed(42)
+    # torch.manual_seed(42)
     
     # Generate synthetic data
     print("Generating synthetic LDA data...")
@@ -341,59 +399,27 @@ def main():
     )
     docs = torch.tensor(documents, dtype=torch.float32)
     
+    # Split into train and test sets (80-20 split)
+    n_train = int(0.8 * n_docs)
+    train_docs = torch.tensor(documents[:n_train], dtype=torch.float32)
+    test_docs = torch.tensor(documents[n_train:], dtype=torch.float32)
+    
+    print(f"Training on {n_train} documents, testing on {n_docs - n_train} documents")
+    
     # Train model with vanilla BBVI using AdaGrad and learning rate scheduling
     print("Training LDA model with vanilla BBVI using AdaGrad and learning rate scheduling...")
-    start = time.time()
+    
     model, elbo_values, lr_values = train_bbvi(
-        docs, n_topics, alpha0, eta0, n_iterations, initial_lr, n_samples, device,
+        train_docs, n_topics, alpha0, eta0, n_iterations, initial_lr, n_samples, device,
         scheduler_step_size, scheduler_gamma
     )
-    stop = time.time()
     
     # Extract iteration and ELBO values for plotting
     iterations, elbos = zip(*elbo_values)
-    time_steps = np.linspace(0, stop-start, len(elbos))
-    df = pd.DataFrame({"elbo": elbos, "time_steps": time_steps})
-    df.to_csv("vanilla_bbvi_dataset.csv")
     
-    # Apply moving average to smooth the plot
-    window_size = 10
-    if len(elbos) > window_size:
-        elbo_smoothed = np.convolve(elbos, np.ones(window_size)/window_size, mode='valid')
-        smooth_iterations = iterations[window_size-1:len(iterations)]
-    else:
-        elbo_smoothed = elbos
-        smooth_iterations = iterations
-    
-    # Plot ELBO trace
-    plt.figure(figsize=(10, 6))
-    plt.plot(iterations, elbos, 'o-', alpha=0.4, label='Raw ELBO')
-    plt.plot(smooth_iterations, elbo_smoothed, 'r-', linewidth=2, label='Smoothed ELBO')
-    plt.title('ELBO Convergence with BBVI using AdaGrad + Scheduler')
-    plt.xlabel('Iteration')
-    plt.ylabel('ELBO')
-    plt.grid(True)
-    plt.legend()
-    # plt.savefig('bbvi_elbo_trace.png')
-    plt.show()
-    
-    # Plot learning rates
-    if lr_values:
-        lr_iterations, lr_rates = zip(*lr_values)
-        plt.figure(figsize=(10, 4))
-        plt.plot(lr_iterations, lr_rates)
-        plt.title('AdaGrad Effective Learning Rate with Scheduler')
-        plt.xlabel('Iteration')
-        plt.ylabel('Effective Learning Rate')
-        plt.grid(True)
-        plt.yscale('log')  # Log scale to better visualize the decay
-        # plt.savefig('bbvi_adagrad_lr_trace.png')
-        plt.show()
-    
-    print("ELBO trace plot saved as 'bbvi_elbo_trace.png'")
-    if lr_values:
-        print("AdaGrad learning rate plot saved as 'bbvi_adagrad_lr_trace.png'")
-
+    # Compute predictive likelihood on test set
+    per_word_likelihood = model.compute_predictive_likelihood(test_docs)
+    print(f"  Per-word log-likelihood: {per_word_likelihood:.4f}")
 
 if __name__ == "__main__":
     main()
